@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地浏览器可见性测试</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 820px; margin: 40px auto; padding: 0 20px; line-height: 1.6; }
+    .card { border: 1px solid #8886; border-radius: 12px; padding: 18px; margin: 16px 0; }
+    .ok { color: #16803c; } .warn { color: #b05b00; }
+    code, pre { background: #8882; border-radius: 6px; padding: 2px 5px; }
+    pre { padding: 12px; overflow: auto; white-space: pre-wrap; }
+    button { padding: 8px 14px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>本地浏览器可见性测试</h1>
+  <p>此页面只测试普通网页权限，不会读取或枚举 Windows 进程。</p>
+
+  <section class="card">
+    <h2>结论</h2>
+    <p id="conclusion" class="ok">普通网页无法直接枚举本机进程。</p>
+    <p>如果页面能访问某个本地服务，只能说明该端口有服务响应，不能据此证明浏览器发现了某个进程。</p>
+  </section>
+
+  <section class="card">
+    <h2>网页可见信息</h2>
+    <pre id="info">正在读取……</pre>
+  </section>
+
+  <section class="card">
+    <h2>本地端口探测（可选）</h2>
+    <p>可探测指定端口或一小段端口范围。服务可能因 CORS、HTTPS 或防火墙而无法被读取；发现端口不等于发现进程。</p>
+    <label>端口：<input id="port" type="number" min="1" max="65535" value="5173"></label>
+    <button id="probe">探测</button>
+    <p><label>范围：<input id="from" type="number" min="1" max="65535" value="1418"> - <input id="to" type="number" min="1" max="65535" value="1423"></label>
+    <button id="scan">扫描范围</button></p>
+    <pre id="result">尚未探测</pre>
+  </section>
+
+  <section class="card">
+    <h2>浏览器能力检查</h2>
+    <p>这些项目只能说明浏览器暴露了哪些能力，不能证明某个桌面程序存在。</p>
+    <pre id="capabilities">正在检查……</pre>
+  </section>
+
+  <script>
+    const info = {
+      userAgent: navigator.userAgent,
+      platform: navigator.platform,
+      language: navigator.language,
+      online: navigator.onLine,
+      visibility: document.visibilityState,
+      screen: `${screen.width} × ${screen.height}`,
+      webdriver: navigator.webdriver,
+      origin: location.origin
+    };
+    document.querySelector('#info').textContent = JSON.stringify(info, null, 2);
+
+    const capabilityChecks = {
+      '是否允许读取 localhost 响应': 'fetch' in window,
+      '是否支持 WebSocket': 'WebSocket' in window,
+      '是否支持 Service Worker': 'serviceWorker' in navigator,
+      '是否支持 WebUSB': 'usb' in navigator,
+      '是否支持 WebSerial': 'serial' in navigator,
+      '是否支持 WebHID': 'hid' in navigator,
+      '是否被 WebDriver 标记': navigator.webdriver === true,
+      '是否在安全上下文': window.isSecureContext,
+      '是否为 Tauri 内嵌页面': Boolean(window.__TAURI_INTERNALS__)
+    };
+    document.querySelector('#capabilities').textContent = Object.entries(capabilityChecks)
+      .map(([name, value]) => `${value ? '✓' : '—'} ${name}: ${value}`).join('\n');
+
+    document.querySelector('#probe').addEventListener('click', async () => {
+      const port = Number(document.querySelector('#port').value);
+      const output = document.querySelector('#result');
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        output.textContent = '请输入 1 到 65535 之间的端口。'; return;
+      }
+      const url = `http://127.0.0.1:${port}/`;
+      output.textContent = `正在请求 ${url} ……`;
+      const started = performance.now();
+      try {
+        const response = await fetch(url, { mode: 'cors', cache: 'no-store' });
+        output.textContent = `有 HTTP 响应：${response.status} ${response.statusText}\n耗时：${Math.round(performance.now() - started)} ms\n注意：这不是进程枚举结果。`;
+      } catch (error) {
+        output.textContent = `无法读取响应（端口未开放、CORS 拒绝或网络错误）。\n耗时：${Math.round(performance.now() - started)} ms\n${error}`;
+      }
+    });
+
+    document.querySelector('#scan').addEventListener('click', async () => {
+      const from = Number(document.querySelector('#from').value);
+      const to = Number(document.querySelector('#to').value);
+      const output = document.querySelector('#result');
+      if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to > 65535 || to < from || to - from > 50) {
+        output.textContent = '请输入合法范围，且一次最多扫描 51 个端口。'; return;
+      }
+      output.textContent = `正在扫描 127.0.0.1:${from}-${to} ……`;
+      const results = await Promise.all(Array.from({ length: to - from + 1 }, async (_, i) => {
+        const port = from + i;
+        const started = performance.now();
+        try {
+          const response = await fetch(`http://127.0.0.1:${port}/`, { mode: 'no-cors', cache: 'no-store' });
+          return `${port}: 有连接结果（${Math.round(performance.now() - started)} ms，no-cors）`;
+        } catch (_) { return null; }
+      }));
+      const open = results.filter(Boolean);
+      output.textContent = open.length ? open.join('\n') + '\n\n注意：浏览器无法告诉页面对应的进程。' : '未发现可连接的端口。';
+    });
+  </script>
+</body>
+</html>
