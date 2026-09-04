@@ -1,18 +1,115 @@
 use crate::AppState;
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use p256::{ecdh::diffie_hellman, elliptic_curve::sec1::ToEncodedPoint, PublicKey, SecretKey};
+use rand::RngCore;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use tauri::{AppHandle, Manager};
+use uuid::Uuid;
 
+const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+
+#[derive(Clone)]
+struct CryptoState {
+    sessions: Arc<Mutex<HashMap<String, ([u8; 32], Instant)>>>,
+}
+impl CryptoState {
+    fn new() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn prune(&self) {
+        let now = Instant::now();
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.retain(|_, (_, last_used)| now.duration_since(*last_used) <= SESSION_TTL);
+        }
+    }
+    fn establish(&self, client_public: &[u8]) -> Result<(String, String), String> {
+        self.prune();
+        let client = PublicKey::from_sec1_bytes(client_public).map_err(|_| "无效的客户端公钥")?;
+        let secret = SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let public = secret.public_key().to_encoded_point(false);
+        let shared = diffie_hellman(secret.to_nonzero_scalar(), client.as_affine());
+        let digest = Sha256::digest(shared.raw_secret_bytes());
+        let key: [u8; 32] = digest.into();
+        let session_id = Uuid::new_v4().to_string();
+        self.sessions
+            .lock()
+            .map_err(|_| "加密会话不可用")?
+            .insert(session_id.clone(), (key, Instant::now()));
+        Ok((session_id, STANDARD.encode(public.as_bytes())))
+    }
+
+    fn key(&self, session_id: &str) -> Option<[u8; 32]> {
+        self.prune();
+        let mut sessions = self.sessions.lock().ok()?;
+        let (key, last_used) = sessions.get_mut(session_id)?;
+        *last_used = Instant::now();
+        Some(*key)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct HandshakeRequest {
+    #[serde(rename = "clientPublic")]
+    client_public: String,
+}
+
+#[derive(serde::Deserialize)]
+struct EncryptedEnvelope {
+    encrypted: Option<bool>,
+    iv: String,
+    data: String,
+}
+
+fn encrypt_bytes(key: &[u8; 32], plaintext: &[u8]) -> Result<String, String> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "加密密钥无效")?;
+    let mut iv = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut iv);
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&iv), plaintext)
+        .map_err(|_| "加密失败")?;
+    Ok(serde_json::to_string(&json!({
+        "encrypted": true,
+        "iv": STANDARD.encode(iv),
+        "data": STANDARD.encode(ciphertext),
+    }))
+    .map_err(|_| "加密响应序列化失败")?)
+}
+
+fn decrypt_bytes(key: &[u8; 32], payload: &[u8]) -> Result<Vec<u8>, String> {
+    let envelope: EncryptedEnvelope =
+        serde_json::from_slice(payload).map_err(|_| "请求不是有效的加密数据")?;
+    if envelope.encrypted != Some(true) {
+        return Err("请求未标记为加密数据".into());
+    }
+    let iv = STANDARD.decode(envelope.iv).map_err(|_| "加密随机数无效")?;
+    let data = STANDARD.decode(envelope.data).map_err(|_| "加密内容无效")?;
+    if iv.len() != 12 {
+        return Err("加密随机数长度无效".into());
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "解密密钥无效")?;
+    cipher
+        .decrypt(Nonce::from_slice(&iv), data.as_ref())
+        .map_err(|_| "无法解密请求内容（会话可能已失效）".into())
+}
 pub struct LocalServer {
     stop: Arc<AtomicBool>,
 }
@@ -24,6 +121,7 @@ impl LocalServer {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
+        let crypto = Arc::new(CryptoState::new());
         let signal = stop.clone();
         thread::spawn(move || {
             while !signal.load(Ordering::Relaxed) {
@@ -31,8 +129,14 @@ impl LocalServer {
                     Ok((mut stream, _)) => {
                         let connection_app = app.clone();
                         let connection_state = state.clone();
+                        let connection_crypto = crypto.clone();
                         thread::spawn(move || {
-                            let _ = handle(&mut stream, &connection_app, &connection_state);
+                            let _ = handle(
+                                &mut stream,
+                                &connection_app,
+                                &connection_state,
+                                &connection_crypto,
+                            );
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -49,98 +153,524 @@ impl LocalServer {
     }
 }
 
-const MOBILE_PAGE_V2: &str = r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>宝宝巴士控制台</title><style>body{font:18px system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;background:#10141f;color:#e8edf7}h1{font-size:30px}p{color:#aabbd6}.buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}button{min-height:70px;padding:16px 12px;font-size:20px;font-weight:600;border-radius:14px;border:1px solid #496997;background:#29436d;color:#fff}.card{background:#18243a;border-radius:12px;padding:14px;margin:16px 0}.thumbs{display:flex;gap:8px;flex-wrap:wrap}.thumbs img{width:150px;height:100px;object-fit:cover;border-radius:7px}.answer{white-space:pre-wrap;line-height:1.55;overflow-wrap:anywhere}@media(max-width:520px){.buttons{grid-template-columns:1fr}button{min-height:76px}}</style><h1>宝宝巴士控制台</h1><p>同一局域网内使用。截图后点击提交。</p><div class=buttons><button onclick="cmd('capture','general')">通用截图</button><button onclick="cmd('capture','math')">数学截图</button><button onclick="cmd('capture','code')">代码截图</button><button onclick="cmd('submit')">提交题目</button><button onclick="cmd('clear')">清空草稿</button><button onclick="cmd('cancel')">取消任务</button></div><div id=view class=card>加载中…</div><script>const saved=new Set;async function cmd(c,p){await fetch('/api/'+c+(p?'?preset='+p:''),{method:'POST'});load()}function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function saveImages(d){if(!d.config?.mobile_auto_save_images||!d.draft?.thumbnails)return;d.draft.thumbnails.forEach((src,i)=>{const key=d.draft.id+':'+i;if(saved.has(key))return;saved.add(key);const a=document.createElement('a');a.href=src;a.download='baobao-bashi-'+d.draft.id+'-'+(i+1)+'.png';a.click()})}function render(d){saveImages(d);let h='<b>状态：</b>'+esc(d.status||'')+'<br>'+esc(d.message||'');if(d.draft){h+='<h3>完整截图预览（'+d.draft.image_count+' 张）</h3><div class=thumbs>'+(d.draft.thumbnails||[]).map((x,i)=>'<img src="'+x+'" alt="截图 '+(i+1)+'">').join('')+'</div>'}if(d.stream_output)h+='<h3>流式输出</h3><div class=answer>'+esc(d.stream_output)+'</div>';if(d.answer)h+='<h3>答案</h3><div class=answer>'+esc(d.answer.text)+'</div>';view.innerHTML=h}async function load(){try{render(await (await fetch('/api/state')).json())}catch(e){view.textContent='连接失败：'+e}}load();setInterval(load,1000)</script>"#;
+fn websocket_accept(key: &str) -> String {
+    let mut data = format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").into_bytes();
+    let bit_len = (data.len() as u64) * 8;
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0)
+    }
+    data.extend_from_slice(&bit_len.to_be_bytes());
+    let mut h = [
+        0x67452301u32,
+        0xefcdab89,
+        0x98badcfe,
+        0x10325476,
+        0xc3d2e1f0,
+    ];
+    for chunk in data.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ])
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1)
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e)
+    }
+    let mut out = [0u8; 20];
+    for (i, v) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes())
+    }
+    STANDARD.encode(out)
+}
+fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, Vec<u8>)> {
+    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+    let mut bytes = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    let header_end = loop {
+        let count = stream.read(&mut chunk)?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "empty HTTP request",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP request too large",
+            ));
+        }
+        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    if content_length > 8 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP body too large",
+        ));
+    }
+    while bytes.len() - header_end < content_length {
+        let count = stream.read(&mut chunk)?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated HTTP body",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    let mut body = bytes[header_end..].to_vec();
+    body.truncate(content_length);
+    Ok((head, body))
+}
 
-const MOBILE_PAGE_V3: &str = r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>宝宝巴士控制台</title><style>body{font:18px system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;background:#10141f;color:#e8edf7}h1{font-size:30px}p{color:#aabbd6}.buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}button{min-height:70px;padding:16px 12px;font-size:20px;font-weight:600;border-radius:14px;border:1px solid #496997;background:#29436d;color:#fff;transition:transform .08s,background .08s}button:active,button.busy{transform:scale(.96);background:#416fb8}.card{background:#18243a;border-radius:12px;padding:14px;margin:16px 0}.thumbs{display:flex;gap:8px;flex-wrap:wrap}.thumbs img{width:150px;height:100px;object-fit:cover;border-radius:7px}.answer{white-space:pre-wrap;line-height:1.55;overflow-wrap:anywhere}.conn{min-height:1.4em;color:#f5c26b}@media(max-width:520px){.buttons{grid-template-columns:1fr}button{min-height:76px}}</style><h1>宝宝巴士控制台</h1><p>同一局域网内使用。截图后点击提交。</p><div class=buttons><button data-action="capture" data-preset="general">通用截图</button><button data-action="capture" data-preset="math">数学截图</button><button data-action="capture" data-preset="code">代码截图</button><button data-action="submit">提交题目</button><button data-action="clear">清空草稿</button><button data-action="cancel">取消任务</button></div><div id=conn class=conn></div><div id=state class=card>加载中…</div><script>const saved=new Set;let last=null,retry=1000;const stateEl=document.getElementById('state'),connEl=document.getElementById('conn');function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function saveImages(d){if(!d.config?.mobile_auto_save_images||!d.draft?.thumbnails)return;d.draft.thumbnails.forEach((src,i)=>{const key=d.draft.id+':'+i;if(saved.has(key))return;saved.add(key);const a=document.createElement('a');a.href=src;a.download='baobao-bashi-'+d.draft.id+'-'+(i+1)+'.png';a.click()})}function render(d){saveImages(d);let h='<b>状态：</b>'+esc(d.status||'')+'<br>'+esc(d.message||'');if(d.draft){h+='<h3>完整截图预览（'+d.draft.image_count+' 张）</h3><div class=thumbs>'+(d.draft.thumbnails||[]).map((x,i)=>'<img src="'+x+'" alt="截图 '+(i+1)+'">').join('')+'</div>'}if(d.stream_output)h+='<h3>流式输出</h3><div class=answer>'+esc(d.stream_output)+'</div>';if(d.answer)h+='<h3>答案</h3><div class=answer>'+esc(d.answer.text)+'</div>';stateEl.innerHTML=h}function setConn(ok,msg){connEl.textContent=ok?'':(msg||'连接暂时中断，正在重试…')}async function load(){const ctl=new AbortController,t=setTimeout(()=>ctl.abort(),4000);try{const r=await fetch('/api/state',{cache:'no-store',signal:ctl.signal});if(!r.ok)throw Error('HTTP '+r.status);last=await r.json();render(last);setConn(true);retry=1000}catch(e){setConn(false);retry=Math.min(Math.round(retry*1.5),10000)}finally{clearTimeout(t);setTimeout(load,retry)}}async function cmd(c,p){const b=[...document.querySelectorAll('button')].find(x=>x.dataset.action===c&&(!p||x.dataset.preset===p));if(b){b.classList.add('busy');b.disabled=true}try{const r=await fetch('/api/'+c+(p?'?preset='+p:''),{method:'POST',cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);setConn(true);retry=1000;load()}catch(e){setConn(false,'操作失败，连接将自动重试…')}finally{if(b){b.classList.remove('busy');b.disabled=false}}}document.querySelectorAll('button').forEach(b=>b.onclick=()=>cmd(b.dataset.action,b.dataset.preset));load();</script>"#;
+fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request.lines().find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        header.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
+
+fn query_value(path: &str, name: &str) -> Option<String> {
+    path.split_once('?')?.1.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == name).then_some(value.to_owned())
+    })
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Baobao-Session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.as_bytes().len()
+    );
+    stream.write_all(response.as_bytes())
+}
+
+fn write_ws_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    let len = payload.len();
+    let mut frame = Vec::with_capacity(len + 10);
+    frame.push(0x81);
+    if len < 126 {
+        frame.push(len as u8);
+    } else if len <= u16::MAX as usize {
+        frame.push(126);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame)
+}
+
+fn read_ws_commands(mut reader: TcpStream, app: AppHandle, key: [u8; 32]) {
+    loop {
+        let mut header = [0u8; 2];
+        if reader.read_exact(&mut header).is_err() {
+            break;
+        }
+        let opcode = header[0] & 0x0f;
+        if opcode == 0x8 {
+            break;
+        }
+        let masked = header[1] & 0x80 != 0;
+        let mut length = (header[1] & 0x7f) as usize;
+        if length == 126 {
+            let mut bytes = [0u8; 2];
+            if reader.read_exact(&mut bytes).is_err() {
+                break;
+            }
+            length = u16::from_be_bytes(bytes) as usize;
+        } else if length == 127 {
+            let mut bytes = [0u8; 8];
+            if reader.read_exact(&mut bytes).is_err() {
+                break;
+            }
+            let value = u64::from_be_bytes(bytes);
+            if value > usize::MAX as u64 {
+                break;
+            }
+            length = value as usize;
+        }
+        if length > 1024 * 1024 {
+            break;
+        }
+        let mut mask = [0u8; 4];
+        if masked && reader.read_exact(&mut mask).is_err() {
+            break;
+        }
+        let mut payload = vec![0u8; length];
+        if reader.read_exact(&mut payload).is_err() {
+            break;
+        }
+        if masked {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[index % 4];
+            }
+        }
+        if opcode != 0x1 {
+            continue;
+        }
+        let Ok(decrypted) = decrypt_bytes(&key, &payload) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decrypted) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("command") {
+            continue;
+        }
+        let action = value
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let command = match action {
+            "capture" | "submit" | "clear" | "cancel" => action,
+            _ => continue,
+        };
+        let preset_id = value
+            .get("presetId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("general")
+            .to_owned();
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        crate::dispatch_remote_command(app.clone(), id, command.to_owned(), preset_id);
+    }
+}
 
 fn handle(
     stream: &mut TcpStream,
     app: &AppHandle,
     state: &Arc<AppState>,
+    crypto: &Arc<CryptoState>,
 ) -> std::io::Result<()> {
-    let mut buffer = [0u8; 8192];
-    let size = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..size]);
-    if request.starts_with("GET /ws") && request.to_ascii_lowercase().contains("upgrade: websocket") {
-        if let Some(key) = request.lines().find_map(|line| line.strip_prefix("Sec-WebSocket-Key:").map(str::trim)) {
-            // Handshake is accepted by the transport shim; clients still retain
-            // polling fallback when a strict WebSocket proxy rejects this path.
-            let accept = STANDARD.encode(key.as_bytes());
-            stream.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes())?;
-            // Server-to-client state frames are intentionally unmasked. The client
-            // can reconnect at any time; polling remains the fallback transport.
-            loop {
-                let payload = serde_json::to_vec(&state.snapshot()).unwrap_or_else(|_| b"{}".to_vec());
-                let len = payload.len();
-                if len >= 126 { break; }
-                let mut frame = Vec::with_capacity(len + 2);
-                frame.push(0x81);
-                frame.push(len as u8);
-                frame.extend_from_slice(&payload);
-                if stream.write_all(&frame).is_err() { break; }
-                thread::sleep(Duration::from_millis(250));
-            }
-            return Ok(());
-        }
-    }
+    let (request, body) = read_http_request(stream)?;
     let mut lines = request.lines();
     let first = lines.next().unwrap_or("");
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
     let route = path.split('?').next().unwrap_or(path);
-    let (status, content_type, body) = if method == "GET" && route == "/" {
-        (
-            "200 OK",
-            "text/html; charset=utf-8",
-            MOBILE_PAGE_V3
-                .replace("stateEl.innerHTML=h", "stateEl.innerHTML=h;stateEl.querySelectorAll('.answer').forEach(el=>{el.innerHTML=md(el.textContent||'')})")
-                .replace("<div id=conn class=conn>", "<div id=toast class=toast></div><div id=conn class=conn>")
-                .replace("if(d.stream_output)h+='<h3>流式输出</h3><div class=answer>'+esc(d.stream_output)+'</div>';", "")
-                .replace(".conn{min-height:1.4em;color:#f5c26b}", ".conn{min-height:1.4em;color:#f5c26b}.toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,16px);opacity:0;background:#315b96;color:#fff;padding:12px 18px;border-radius:999px;transition:.2s;pointer-events:none;z-index:5}.toast.show{opacity:1;transform:translate(-50%,0)}")
-                .replace("async function cmd(c,p)", "function toast(v){const el=document.getElementById('toast');el.textContent=v;el.classList.add('show');clearTimeout(window.__toast);window.__toast=setTimeout(()=>el.classList.remove('show'),1800)}async function cmd(c,p)")
-                .replace("setConn(true);retry=1000;load()", "setConn(true);retry=1000;toast('请求已发送')")
-                .replace("setConn(false,'操作失败，连接将自动重试…')", "setConn(false,'操作失败，连接将自动重试…');toast('操作失败，正在重试')")
-                .replace("load();</script>", "load();try{const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.onopen=()=>setConn(true);ws.onmessage=e=>{try{last=JSON.parse(e.data);render(last);setConn(true)}catch(_){}};ws.onclose=()=>{if(!last)setConn(false)}}catch(_){};</script>")
-                .to_owned(),
-        )
-    } else if method == "GET" && route == "/api/state" {
-        (
+    if method == "OPTIONS" {
+        return write_response(stream, "204 No Content", "text/plain; charset=utf-8", "");
+    }
+
+    if method == "POST" && route == "/api/handshake" {
+        let request: HandshakeRequest = match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(_) => {
+                return write_response(
+                    stream,
+                    "400 Bad Request",
+                    "application/json",
+                    "{\"error\":\"无效的握手请求\"}",
+                )
+            }
+        };
+        let client_public = match STANDARD.decode(request.client_public) {
+            Ok(value) => value,
+            Err(_) => {
+                return write_response(
+                    stream,
+                    "400 Bad Request",
+                    "application/json",
+                    "{\"error\":\"客户端公钥编码无效\"}",
+                )
+            }
+        };
+        let (session_id, server_public) = match crypto.establish(&client_public) {
+            Ok(value) => value,
+            Err(error) => {
+                return write_response(
+                    stream,
+                    "400 Bad Request",
+                    "application/json",
+                    &serde_json::to_string(&json!({"error": error}))
+                        .unwrap_or_else(|_| "{\"error\":\"握手失败\"}".into()),
+                )
+            }
+        };
+        let response =
+            serde_json::to_string(&json!({"sessionId": session_id, "serverPublic": server_public}))
+                .unwrap_or_else(|_| "{}".into());
+        return write_response(
+            stream,
             "200 OK",
             "application/json; charset=utf-8",
-            serde_json::to_string(&state.snapshot()).unwrap_or_else(|_| "{}".into()),
-        )
-    } else if method == "POST"
+            &response,
+        );
+    }
+
+    if route.starts_with("/assets/") && method == "GET" {
+        let web_root = app
+            .path()
+            .resource_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("../dist"));
+        let file = route.trim_start_matches("/assets/");
+        let safe = !file.contains("..") && !file.contains('\\');
+        if !safe {
+            return write_response(
+                stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                "Bad path",
+            );
+        }
+        let path = web_root.join("assets").join(file);
+        let bytes = std::fs::read(&path)
+            .or_else(|_| std::fs::read(std::path::PathBuf::from("../dist/assets").join(file)));
+        let Ok(bytes) = bytes else {
+            return write_response(
+                stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "Not found",
+            );
+        };
+        let content_type = if file.ends_with(".js") {
+            "application/javascript"
+        } else if file.ends_with(".css") {
+            "text/css"
+        } else {
+            "application/octet-stream"
+        };
+        let body = String::from_utf8_lossy(&bytes);
+        return write_response(stream, "200 OK", content_type, &body);
+    }
+    if method == "GET" && route == "/" {
+        let web_root = app
+            .path()
+            .resource_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("../dist"));
+        let body = std::fs::read_to_string(web_root.join("mobile.html"))
+            .or_else(|_| std::fs::read_to_string("../dist/mobile.html"))
+            .unwrap_or_default();
+        return write_response(stream, "200 OK", "text/html; charset=utf-8", &body);
+    }
+
+    let session_id = header_value(&request, "X-Baobao-Session")
+        .map(str::to_owned)
+        .or_else(|| query_value(path, "session"));
+    let Some(session_id) = session_id else {
+        return write_response(
+            stream,
+            "401 Unauthorized",
+            "application/json",
+            "{\"error\":\"需要先建立加密会话\"}",
+        );
+    };
+    let Some(session_key) = crypto.key(&session_id) else {
+        return write_response(
+            stream,
+            "401 Unauthorized",
+            "application/json",
+            "{\"error\":\"加密会话已失效，请刷新手机页面\"}",
+        );
+    };
+
+    if method == "GET" && route == "/api/state" {
+        let plaintext = serde_json::to_vec(&state.snapshot()).unwrap_or_else(|_| b"{}".to_vec());
+        let encrypted = encrypt_bytes(&session_key, &plaintext).unwrap_or_else(|_| "{}".into());
+        return write_response(
+            stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            &encrypted,
+        );
+    }
+    if method == "GET"
+        && route == "/ws"
+        && request.to_ascii_lowercase().contains("upgrade: websocket")
+    {
+        let Some(key) = header_value(&request, "sec-websocket-key") else {
+            return write_response(
+                stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                "Missing WebSocket key",
+            );
+        };
+        let accept = websocket_accept(key);
+        stream.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes())?;
+        stream.set_read_timeout(None)?;
+        if let Ok(reader) = stream.try_clone() {
+            let command_app = app.clone();
+            thread::spawn(move || read_ws_commands(reader, command_app, session_key));
+        }
+        let mut last_plaintext = Vec::new();
+        let mut last_ping = Instant::now();
+        loop {
+            let packet = json!({"type":"state.snapshot", "snapshot": state.snapshot()});
+            let plaintext = serde_json::to_vec(&packet).unwrap_or_else(|_| b"{}".to_vec());
+            if plaintext != last_plaintext {
+                let encrypted = match encrypt_bytes(&session_key, &plaintext) {
+                    Ok(value) => value,
+                    Err(_) => break,
+                };
+                if write_ws_frame(stream, encrypted.as_bytes()).is_err() {
+                    break;
+                }
+                last_plaintext = plaintext;
+            }
+            if last_ping.elapsed() >= Duration::from_secs(15) {
+                if stream.write_all(&[0x89, 0]).is_err() {
+                    break;
+                }
+                last_ping = Instant::now();
+            }
+            thread::sleep(Duration::from_millis(350));
+        }
+        return Ok(());
+    }
+    if method == "POST"
         && ["/api/capture", "/api/submit", "/api/clear", "/api/cancel"].contains(&route)
     {
-        let command = if route == "/api/capture" {
-            "capture"
-        } else if route == "/api/submit" {
-            "submit"
-        } else if route == "/api/clear" {
-            "clear"
-        } else {
-            "cancel"
+        let decrypted = match decrypt_bytes(&session_key, &body) {
+            Ok(value) => value,
+            Err(error) => {
+                return write_response(
+                    stream,
+                    "400 Bad Request",
+                    "application/json",
+                    &serde_json::to_string(&json!({"error": error}))
+                        .unwrap_or_else(|_| "{\"error\":\"请求解密失败\"}".into()),
+                )
+            }
         };
-        let preset = path.split("preset=").nth(1).unwrap_or("general");
-        let _ = app.emit(
-            "remote-command",
-            json!({"command": command, "presetId": preset}),
+        let value: serde_json::Value = match serde_json::from_slice(&decrypted) {
+            Ok(value) => value,
+            Err(_) => {
+                return write_response(
+                    stream,
+                    "400 Bad Request",
+                    "application/json",
+                    "{\"error\":\"解密后的命令无效\"}",
+                )
+            }
+        };
+        let command = match route {
+            "/api/capture" => "capture",
+            "/api/submit" => "submit",
+            "/api/clear" => "clear",
+            _ => "cancel",
+        };
+        let command_id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let preset = value
+            .get("presetId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("general");
+        crate::dispatch_remote_command(
+            app.clone(),
+            command_id.to_owned(),
+            command.to_owned(),
+            preset.to_owned(),
         );
-        (
+        let response = encrypt_bytes(
+            &session_key,
+            serde_json::to_string(&json!({"accepted": true, "id": command_id}))
+                .unwrap_or_else(|_| "{}".into())
+                .as_bytes(),
+        )
+        .unwrap_or_else(|_| "{}".into());
+        return write_response(
+            stream,
             "202 Accepted",
-            "application/json",
-            "{\"accepted\":true}".into(),
-        )
-    } else {
-        (
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            "Not found".into(),
-        )
-    };
-    let response = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.as_bytes().len());
-    stream.write_all(response.as_bytes())
+            "application/json; charset=utf-8",
+            &response,
+        );
+    }
+    write_response(
+        stream,
+        "404 Not Found",
+        "text/plain; charset=utf-8",
+        "Not found",
+    )
 }
 
-const MOBILE_PAGE: &str = r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>宝宝巴士控制台</title><style>body{font:18px system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;background:#10141f;color:#e8edf7}h1{font-size:30px}p{color:#aabbd6}.buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}button{min-height:70px;padding:16px 12px;font-size:20px;font-weight:600;border-radius:14px;border:1px solid #496997;background:#29436d;color:#fff;box-shadow:0 5px 14px #05091280}button:active{transform:scale(.98);background:#416fb8}.card{background:#18243a;border-radius:12px;padding:14px;margin:16px 0}.thumbs{display:flex;gap:8px;flex-wrap:wrap}.thumbs img{width:120px;height:78px;object-fit:cover;border-radius:7px;border:1px solid #496997}.answer{white-space:pre-wrap;line-height:1.55;overflow-wrap:anywhere}@media(max-width:520px){.buttons{grid-template-columns:1fr}button{min-height:76px}}</style><h1>宝宝巴士控制台</h1><p>同一局域网内使用。截图后点击提交。</p><div class=buttons><button onclick="cmd('capture','general')">通用截图</button><button onclick="cmd('capture','math')">数学截图</button><button onclick="cmd('capture','code')">代码截图</button><button onclick="cmd('submit')">提交题目</button><button onclick="cmd('clear')">清空草稿</button><button onclick="cmd('cancel')">取消任务</button></div><div id=view class=card>加载中…</div><script>async function cmd(c,p){await fetch('/api/'+c+(p?'?preset='+p:''),{method:'POST'});load()}function esc(v){return String(v??'').replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[m]))}function render(d){let h='<b>状态：</b>'+esc(d.status||'')+'<br>'+esc(d.message||'');if(d.draft){h+='<h3>截图预览（'+d.draft.image_count+' 张）</h3><div class=thumbs>'+(d.draft.thumbnails||[]).map((x,i)=>'<img src="'+x+'" alt="截图 '+(i+1)+'">').join('')+'</div>'}if(d.stream_output)h+='<h3>流式输出</h3><div class=answer>'+esc(d.stream_output)+'</div>';if(d.answer)h+='<h3>答案</h3><div class=answer>'+esc(d.answer.text)+'</div>';view.innerHTML=h}async function load(){try{render(await (await fetch('/api/state')).json())}catch(e){view.textContent='连接失败：'+e}}load();setInterval(load,1000)</script>"#;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aes_gcm_round_trip_and_tamper_detection() {
+        let key = [0x42u8; 32];
+        let plaintext = br#"{"message":"baobao","count":2}"#;
+        let envelope = encrypt_bytes(&key, plaintext).expect("encrypt");
+        let decrypted = decrypt_bytes(&key, envelope.as_bytes()).expect("decrypt");
+        assert_eq!(decrypted, plaintext);
+
+        let mut tampered = serde_json::from_str::<serde_json::Value>(&envelope).expect("envelope");
+        tampered["data"] = serde_json::Value::String("AAAA".into());
+        assert!(decrypt_bytes(&key, tampered.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn ecdh_session_matches_browser_style_shared_x_coordinate() {
+        let crypto = CryptoState::new();
+        let client_secret = SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let client_public = client_secret.public_key().to_encoded_point(false);
+        let (session_id, server_public_b64) = crypto
+            .establish(client_public.as_bytes())
+            .expect("handshake");
+        let server_public =
+            PublicKey::from_sec1_bytes(&STANDARD.decode(server_public_b64).expect("base64"))
+                .expect("server key");
+        let shared = diffie_hellman(client_secret.to_nonzero_scalar(), server_public.as_affine());
+        let expected: [u8; 32] = Sha256::digest(shared.raw_secret_bytes()).into();
+        assert_eq!(crypto.key(&session_id), Some(expected));
+    }
+}

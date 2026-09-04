@@ -1,5 +1,5 @@
-//! Transport-independent contracts for a future paired LAN controller.
-//! The desktop application deliberately does not bind a network listener yet.
+//! Transport-independent contracts for the LAN controller.
+//! The concrete local server owns encrypted sessions; these contracts keep other transports decoupled.
 
 use crate::domain::AnswerResult;
 use serde::{Deserialize, Serialize};

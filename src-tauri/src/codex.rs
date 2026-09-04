@@ -381,14 +381,16 @@ fn terminate_process(child: &mut Child, pid: u32) {
 /// searches executable extensions on some Windows launch paths, while npm
 /// commonly installs Codex as `codex.cmd`.
 fn resolve_codex_cli(configured_path: Option<PathBuf>) -> Result<CodexLaunch> {
-    if let Some(configured) =
-        configured_path.or_else(|| env::var_os("SOLVE_LENS_CODEX_PATH").map(PathBuf::from))
-    {
+    if let Some(configured) = configured_path.or_else(|| {
+        env::var_os("BAOBAO_BASHI_CODEX_PATH")
+            .or_else(|| env::var_os("SOLVE_LENS_CODEX_PATH"))
+            .map(PathBuf::from)
+    }) {
         let candidate = configured;
         if candidate.is_file() {
             return launch_for(candidate);
         }
-        anyhow::bail!("SOLVE_LENS_CODEX_PATH does not point to a file");
+        anyhow::bail!("BAOBAO_BASHI_CODEX_PATH does not point to a file");
     }
 
     let names: &[&str] = if cfg!(windows) {
@@ -414,6 +416,7 @@ fn resolve_codex_cli(configured_path: Option<PathBuf>) -> Result<CodexLaunch> {
     })
 }
 
+#[allow(dead_code)]
 pub fn progress_text(line: &str) -> Option<String> {
     if let Ok(value) = serde_json::from_str::<Value>(line) {
         let mut candidates = Vec::new();
@@ -458,7 +461,7 @@ fn launch_for(candidate: PathBuf) -> Result<CodexLaunch> {
         });
     }
     anyhow::bail!(
-        "Codex npm shim found at {}, but its node.exe or codex.js target is missing; reinstall @openai/codex or set SOLVE_LENS_CODEX_PATH to codex.exe",
+        "Codex npm shim found at {}, but its node.exe or codex.js target is missing; reinstall @openai/codex or set BAOBAO_BASHI_CODEX_PATH to codex.exe",
         candidate.display()
     )
 }

@@ -21,16 +21,19 @@ use crate::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
+    io::Cursor,
     path::PathBuf,
     process::Command,
     str::FromStr,
     sync::{Arc, Mutex},
+    time::UNIX_EPOCH,
 };
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, State, WindowEvent,
+    AppHandle, Emitter, Listener, Manager, State, WindowEvent,
 };
 use tauri::{PhysicalPosition, PhysicalSize, Position, Size};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -50,7 +53,7 @@ struct Inner {
     answer_page: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct HotkeyConfig {
     general: String,
@@ -96,7 +99,7 @@ impl Default for HotkeyConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct AppConfig {
     provider: String,
@@ -145,6 +148,8 @@ pub(crate) struct AppState {
     work_dir: PathBuf,
     history: HistoryStore,
     local_server: Mutex<Option<local_server::LocalServer>>,
+    /// Encoded, downsampled previews are reused by snapshots and WebSocket clients.
+    thumbnail_cache: Mutex<HashMap<PathBuf, (u128, String)>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -164,15 +169,52 @@ struct Snapshot {
 impl AppState {
     pub(crate) fn snapshot(&self) -> Snapshot {
         let inner = self.inner.lock().expect("application state lock");
+        let full_images = self
+            .config
+            .lock()
+            .expect("config lock")
+            .mobile_auto_save_images;
         let mut draft_view = inner.draft.as_ref().map(DraftView::from);
         if let Some(view) = draft_view.as_mut() {
             if let Some(draft) = inner.draft.as_ref() {
+                let mut cache = self.thumbnail_cache.lock().expect("thumbnail cache lock");
+                cache.retain(|path, _| path.exists());
                 view.thumbnails = draft
                     .images
                     .iter()
                     .filter_map(|image| {
+                        let metadata = fs::metadata(&image.path).ok()?;
+                        let modified = metadata
+                            .modified()
+                            .ok()?
+                            .duration_since(UNIX_EPOCH)
+                            .ok()?
+                            .as_nanos();
+                        let stamp = modified
+                            ^ u128::from(metadata.len())
+                            ^ if full_images { u128::MAX } else { 0 };
+                        if let Some((cached_stamp, value)) = cache.get(&image.path) {
+                            if *cached_stamp == stamp {
+                                return Some(value.clone());
+                            }
+                        }
                         let bytes = fs::read(&image.path).ok()?;
-                        Some(format!("data:image/png;base64,{}", BASE64.encode(bytes)))
+                        let value = if full_images {
+                            format!("data:image/png;base64,{}", BASE64.encode(bytes))
+                        } else {
+                            let decoded = ::image::load_from_memory(&bytes).ok()?;
+                            let preview = decoded.thumbnail(480, 360);
+                            let mut encoded = Cursor::new(Vec::new());
+                            preview
+                                .write_to(&mut encoded, ::image::ImageFormat::Png)
+                                .ok()?;
+                            format!(
+                                "data:image/png;base64,{}",
+                                BASE64.encode(encoded.into_inner())
+                            )
+                        };
+                        cache.insert(image.path.clone(), (stamp, value.clone()));
+                        Some(value)
                     })
                     .collect();
             }
@@ -234,12 +276,44 @@ fn persist_config(state: &AppState) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
+fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (base, patch) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(patch)) => {
+            for (key, value) in patch {
+                merge_json(
+                    base.entry(key.clone()).or_insert(serde_json::Value::Null),
+                    value,
+                );
+            }
+        }
+        (base, patch) => *base = patch.clone(),
+    }
+}
 #[tauri::command]
 fn update_config(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
-    config: AppConfig,
+    config: serde_json::Value,
 ) -> Result<(), String> {
+    if !config.is_object() {
+        return Err("配置 patch 必须是 JSON 对象".into());
+    }
+    let mut merged = serde_json::to_value(
+        state
+            .config
+            .lock()
+            .map_err(|_| "config state unavailable")?
+            .clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    merge_json(&mut merged, &config);
+    let config: AppConfig =
+        serde_json::from_value(merged).map_err(|error| format!("配置格式无效：{error}"))?;
+    let previous_config = state
+        .config
+        .lock()
+        .map_err(|_| "config state unavailable")?
+        .clone();
     if !matches!(config.provider.as_str(), "codex-cli" | "claude-code-cli") {
         return Err("未知 Provider，请选择 Codex CLI 或 Claude Code CLI".into());
     }
@@ -263,39 +337,36 @@ fn update_config(
     if !(1024..=65535).contains(&config.lan_control_port) {
         return Err("本地控制端口必须在 1024 到 65535 之间".into());
     }
-    let values = [
-        &config.hotkeys.general,
-        &config.hotkeys.math,
-        &config.hotkeys.code,
-        &config.hotkeys.submit,
-        &config.hotkeys.clear,
-        &config.hotkeys.toggle,
-        &config.hotkeys.next,
-        &config.hotkeys.previous,
-        &config.hotkeys.opacity_up,
-        &config.hotkeys.opacity_down,
-        &config.hotkeys.font_up,
-        &config.hotkeys.font_down,
-        &config.hotkeys.move_left,
-        &config.hotkeys.move_right,
-        &config.hotkeys.move_up,
-        &config.hotkeys.move_down,
-        &config.hotkeys.port_check,
-    ];
-    let mut parsed = Vec::new();
-    for value in values {
-        let shortcut =
-            Shortcut::from_str(value.trim()).map_err(|_| format!("快捷键格式无效：{value}"))?;
-        if parsed.iter().any(|item: &Shortcut| item == &shortcut) {
-            return Err("快捷键不能重复绑定".into());
+    if previous_config.hotkeys != config.hotkeys {
+        let values = [
+            &config.hotkeys.general,
+            &config.hotkeys.math,
+            &config.hotkeys.code,
+            &config.hotkeys.submit,
+            &config.hotkeys.clear,
+            &config.hotkeys.toggle,
+            &config.hotkeys.next,
+            &config.hotkeys.previous,
+            &config.hotkeys.opacity_up,
+            &config.hotkeys.opacity_down,
+            &config.hotkeys.font_up,
+            &config.hotkeys.font_down,
+            &config.hotkeys.move_left,
+            &config.hotkeys.move_right,
+            &config.hotkeys.move_up,
+            &config.hotkeys.move_down,
+            &config.hotkeys.port_check,
+        ];
+        let mut parsed = Vec::new();
+        for value in values {
+            let shortcut =
+                Shortcut::from_str(value.trim()).map_err(|_| format!("快捷键格式无效：{value}"))?;
+            if parsed.iter().any(|item: &Shortcut| item == &shortcut) {
+                return Err("快捷键不能重复绑定".into());
+            }
+            parsed.push(shortcut);
         }
-        parsed.push(shortcut);
     }
-    let previous_config = state
-        .config
-        .lock()
-        .map_err(|_| "config state unavailable")?
-        .clone();
     *state
         .config
         .lock()
@@ -327,25 +398,31 @@ fn update_config(
             None
         };
     }
-    // Apply new bindings immediately; the user should not need to restart the
-    // control center after recording a shortcut.
-    app.global_shortcut()
-        .unregister_all()
-        .map_err(|error| error.to_string())?;
-    register_shortcuts(&app).map_err(|error| error.to_string())?;
-    if let Some(window) = app.get_webview_window("overlay") {
-        window
-            .set_size(Size::Physical(PhysicalSize::new(
-                config.overlay_width,
-                config.overlay_height,
-            )))
+    // Re-register shortcuts only when the shortcut map changed. Saving a
+    // provider/display field must not disturb an already valid registration.
+    if previous_config.hotkeys != config.hotkeys {
+        app.global_shortcut()
+            .unregister_all()
             .map_err(|error| error.to_string())?;
+        register_shortcuts(&app).map_err(|error| error.to_string())?;
+    }
+    if previous_config.overlay_width != config.overlay_width
+        || previous_config.overlay_height != config.overlay_height
+    {
+        if let Some(window) = app.get_webview_window("overlay") {
+            window
+                .set_size(Size::Physical(PhysicalSize::new(
+                    config.overlay_width,
+                    config.overlay_height,
+                )))
+                .map_err(|error| error.to_string())?;
+        }
     }
     let mut inner = state
         .inner
         .lock()
         .map_err(|_| "application state unavailable")?;
-    inner.message = Some("配置已保存；快捷键将在重启应用后生效。".into());
+    inner.message = Some("配置已保存；变更的快捷键已立即应用。".into());
     drop(inner);
     emit_snapshot(&app, &state);
     Ok(())
@@ -454,6 +531,36 @@ fn list_codex_models(state: State<'_, Arc<AppState>>) -> Result<Vec<CodexModelOp
     .map_err(|error| error.to_string())
 }
 
+pub(crate) fn dispatch_remote_command(
+    app: AppHandle,
+    id: String,
+    command: String,
+    preset_id: String,
+) {
+    let _ = app.emit(
+        "command.accepted",
+        serde_json::json!({"type":"command.accepted", "id":id, "action":command}),
+    );
+    let state = app.state::<Arc<AppState>>();
+    let result = match command.as_str() {
+        "capture" => capture_for_preset(app.clone(), state, preset_id),
+        "submit" => submit_draft(app.clone(), state),
+        "clear" => clear_draft(app.clone(), state),
+        "cancel" => cancel_current_job(app.clone(), state),
+        _ => Err("未知远程命令".into()),
+    };
+    if let Err(error) = result {
+        let _ = app.emit(
+            "command.failed",
+            serde_json::json!({"type":"command.failed", "id":id, "error":error}),
+        );
+    } else if matches!(command.as_str(), "clear" | "cancel") {
+        let _ = app.emit(
+            "command.completed",
+            serde_json::json!({"type":"command.completed", "id":id, "action":command}),
+        );
+    }
+}
 fn emit_snapshot(app: &AppHandle, state: &AppState) {
     let _ = app.emit("state-changed", state.snapshot());
 }
@@ -476,45 +583,71 @@ fn capture_for_preset(
     preset_id: String,
 ) -> Result<(), String> {
     state.preset(&preset_id)?;
-    // WDA_EXCLUDEFROMCAPTURE keeps the protected overlay out of supported
-    // Windows capture paths, so capture in place instead of hide/show. This
-    // avoids a visible flash and preserves the user's current overlay state.
-    let image = match capture::capture_primary(&state.work_dir) {
-        Ok(image) => image,
-        Err(error) => {
-            let mut inner = state
-                .inner
-                .lock()
-                .map_err(|_| "application state unavailable")?;
-            inner.status = "failed".into();
-            inner.message = Some(format!("截图失败：{error}"));
-            drop(inner);
-            emit_snapshot(&app, &state);
-            return Err(error.to_string());
+    {
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "application state unavailable")?;
+        if inner.status == "capturing" {
+            return Err("正在截取上一张图片，请稍候".into());
         }
-    };
-    let mut inner = state
-        .inner
-        .lock()
-        .map_err(|_| "application state unavailable")?;
-    match inner.draft.as_mut() {
-        Some(draft) if draft.preset_id == preset_id => {
-            draft.try_push(image).map_err(|error| error.to_string())?
+        if let Some(draft) = inner.draft.as_ref() {
+            if draft.preset_id != preset_id {
+                return Err("当前草稿已绑定其他题型，请先提交或清空".into());
+            }
+            if draft.images.len() >= domain::MAX_IMAGES_PER_DRAFT {
+                return Err(format!(
+                    "单个草稿最多 {} 张截图",
+                    domain::MAX_IMAGES_PER_DRAFT
+                ));
+            }
         }
-        Some(_) => return Err("当前草稿已绑定其他题型，请先提交或清空".into()),
-        None => inner.draft = Some(QuestionDraft::new(preset_id, image)),
+        inner.status = "capturing".into();
+        inner.message = Some("正在后台截取主屏".into());
     }
-    inner.answer = None;
-    inner.answer_preset_id = None;
-    inner.stream_output.clear();
-    inner.answer_page = 0;
-    inner.status = "drafting".into();
-    inner.message = Some("截图已添加到草稿".into());
-    drop(inner);
     emit_snapshot(&app, &state);
+    let work_dir = state.work_dir.clone();
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let captured = capture::capture_primary(&work_dir);
+        let mut inner = match state.inner.lock() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        match captured {
+            Ok(image) => {
+                let push_result = match inner.draft.as_mut() {
+                    Some(draft) => draft
+                        .try_push(image.clone())
+                        .map_err(|error| error.to_string()),
+                    None => {
+                        inner.draft = Some(QuestionDraft::new(preset_id.clone(), image.clone()));
+                        Ok(())
+                    }
+                };
+                if let Err(error) = push_result {
+                    let _ = fs::remove_file(image.path);
+                    inner.status = "failed".into();
+                    inner.message = Some(format!("截图失败：{error}"));
+                } else {
+                    inner.answer = None;
+                    inner.answer_preset_id = None;
+                    inner.stream_output.clear();
+                    inner.answer_page = 0;
+                    inner.status = "drafting".into();
+                    inner.message = Some("截图已添加到草稿".into());
+                }
+            }
+            Err(error) => {
+                inner.status = "failed".into();
+                inner.message = Some(format!("截图失败：{error}"));
+            }
+        }
+        drop(inner);
+        emit_snapshot(&app, &state);
+    });
     Ok(())
 }
-
 #[tauri::command]
 fn clear_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let mut inner = state
@@ -572,7 +705,7 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         let process_state = state.clone();
         let pid_state = process_state.clone();
         let progress_state = process_state.clone();
-        let progress_app = app.clone();
+
         let result = CodexCliProvider::new(
             state.work_dir.clone(),
             config.codex_path.clone(),
@@ -590,21 +723,14 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
                     .expect("application state lock")
                     .active_pid = Some(pid);
             },
-            move |line| {
+            move |_line| {
+                // The product intentionally renders only the final plain-text
+                // answer. Avoid retaining/emitting every provider line so a
+                // long solve cannot flood the UI or LAN connection.
                 let mut inner = progress_state.inner.lock().expect("application state lock");
-                if let Some(text) = codex::progress_text(line) {
-                    if !inner.stream_output.is_empty() {
-                        inner.stream_output.push('\n');
-                    }
-                    inner.stream_output.push_str(&text);
-                    if inner.stream_output.len() > 12_000 {
-                        let trim = inner.stream_output.len() - 12_000;
-                        inner.stream_output.drain(..trim);
-                    }
+                if inner.status == "solving" {
+                    inner.message = Some("正在处理 Codex 输出".into());
                 }
-                inner.message = Some("正在接收 Codex 流式输出".into());
-                drop(inner);
-                emit_snapshot(&progress_app, &progress_state);
             },
         );
         let mut inner = state.inner.lock().expect("application state lock");
@@ -748,7 +874,10 @@ fn update_custom_preset(
         .iter()
         .position(|preset| preset.id == preset_id)
         .ok_or("unknown prompt preset")?;
-    if hotkey != "未设置"
+    let previous_hotkey = presets[position].hotkey.clone();
+    let hotkey_changed = !previous_hotkey.eq_ignore_ascii_case(hotkey.trim());
+    if hotkey_changed
+        && hotkey != "未设置"
         && presets
             .iter()
             .enumerate()
@@ -756,7 +885,7 @@ fn update_custom_preset(
     {
         return Err("快捷键已被其他预设使用".into());
     }
-    if hotkey != "未设置" && Shortcut::from_str(hotkey.trim()).is_err() {
+    if hotkey_changed && hotkey != "未设置" && Shortcut::from_str(hotkey.trim()).is_err() {
         return Err("快捷键格式无效，例如 Ctrl+Alt+4".into());
     }
     let preset = &mut presets[position];
@@ -780,23 +909,28 @@ fn load_presets(path: &PathBuf) -> Vec<PromptPreset> {
     let mut presets = built_in_presets();
     if let Ok(contents) = fs::read(path) {
         if let Ok(saved) = serde_json::from_slice::<Vec<PromptPreset>>(&contents) {
-            for preset in saved
+            for saved_preset in saved
                 .into_iter()
                 .filter(|preset| !preset.id.trim().is_empty())
             {
-                if preset.built_in {
-                    if let Some(existing) = presets.iter_mut().find(|item| item.id == preset.id) {
-                        *existing = preset;
+                // Built-in ids remain built-in even if an older file omitted
+                // the flag. This keeps edited built-ins from becoming a second
+                // hidden custom entry after restart.
+                if let Some(existing) = presets.iter_mut().find(|item| item.id == saved_preset.id) {
+                    if existing.built_in {
+                        existing.name = saved_preset.name;
+                        existing.hotkey = saved_preset.hotkey;
+                        existing.task_template = saved_preset.task_template;
+                        existing.version = saved_preset.version.max(existing.version);
                     }
-                } else {
-                    presets.push(preset);
+                } else if !saved_preset.built_in {
+                    presets.push(saved_preset);
                 }
             }
         }
     }
     presets
 }
-
 fn register_shortcuts(app: &AppHandle) -> tauri::Result<()> {
     let config = app
         .state::<Arc<AppState>>()
@@ -900,22 +1034,23 @@ fn change_answer_page(
     state: State<'_, Arc<AppState>>,
     delta: i32,
 ) -> Result<(), String> {
-    let mut inner = state
-        .inner
-        .lock()
-        .map_err(|_| "application state unavailable")?;
-    if delta >= 0 {
-        inner.answer_page = inner.answer_page.saturating_add(delta as usize);
-    } else {
-        inner.answer_page = inner
-            .answer_page
-            .saturating_sub(delta.unsigned_abs() as usize);
+    // The next/previous shortcuts are keyboard-only because the overlay is
+    // click-through. Scroll the single answer container instead of replacing
+    // the answer with artificial pages.
+    {
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "application state unavailable")?;
+        inner.answer_page = 0;
     }
-    drop(inner);
-    emit_snapshot(&app, &state);
+    app.emit(
+        "overlay-scroll",
+        serde_json::json!({"delta": if delta >= 0 { 1 } else { -1 }}),
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
-
 fn move_overlay(app: AppHandle, dx: i32, dy: i32) -> Result<(), String> {
     let window = app
         .get_webview_window("overlay")
@@ -958,6 +1093,7 @@ fn main() {
                 work_dir,
                 history,
                 local_server: Mutex::new(None),
+                thumbnail_cache: Mutex::new(HashMap::new()),
             });
             let overlay_window = app
                 .get_webview_window("overlay")
@@ -990,6 +1126,36 @@ fn main() {
                 .expect("application state lock")
                 .protected_overlay = protected;
             app.manage(state);
+            // Keep the app-level event bridge for future control transports.
+            // LocalServer dispatches directly, while other transports can still
+            // emit the same event without duplicating business logic.
+            let remote_app = app.handle().clone();
+            app.listen("remote-command", move |event| {
+                let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+                    return;
+                };
+                let command = payload
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if !matches!(command, "capture" | "submit" | "clear" | "cancel") {
+                    return;
+                }
+                crate::dispatch_remote_command(
+                    remote_app.clone(),
+                    payload
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    command.to_owned(),
+                    payload
+                        .get("presetId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("general")
+                        .to_owned(),
+                );
+            }); // LAN commands are dispatched directly by LocalServer into the same business functions.
             let app_state = app.state::<Arc<AppState>>();
             let initial_config = app_state.config.lock().expect("config lock").clone();
             if initial_config.lan_control_enabled {
