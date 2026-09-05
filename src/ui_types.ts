@@ -11,6 +11,30 @@ export type Preset = {
   version: number;
 };
 
+export type CodexReasoningOption = {
+  reasoningEffort: string;
+  description?: string;
+};
+
+export type CodexServiceTierOption = {
+  id: string;
+  name?: string;
+  description?: string;
+};
+
+export type CodexModelOption = {
+  id: string;
+  model?: string;
+  displayName?: string;
+  description?: string;
+  isDefault?: boolean;
+  hidden?: boolean;
+  supportedReasoningEfforts?: CodexReasoningOption[];
+  defaultReasoningEffort?: string;
+  additionalSpeedTiers?: string[];
+  serviceTiers?: CodexServiceTierOption[];
+};
+
 export type Config = {
   provider: string;
   codex_path: string;
@@ -21,6 +45,8 @@ export type Config = {
   overlay_height: number;
   codex_timeout_seconds: number;
   codex_model: string;
+  codex_reasoning_effort: string;
+  codex_service_tier: string;
   prompt_addendum: string;
   lan_control_enabled: boolean;
   lan_control_port: number;

@@ -111,6 +111,10 @@ struct AppConfig {
     overlay_height: u32,
     codex_timeout_seconds: u64,
     codex_model: String,
+    /// Reasoning effort passed to Codex as model_reasoning_effort.
+    codex_reasoning_effort: String,
+    /// Codex service tier: default (standard) or priority (Fast/1.5x when available).
+    codex_service_tier: String,
     prompt_addendum: String,
     lan_control_enabled: bool,
     lan_control_port: u16,
@@ -130,6 +134,8 @@ impl Default for AppConfig {
             overlay_height: 360,
             codex_timeout_seconds: 90,
             codex_model: String::new(),
+            codex_reasoning_effort: "low".into(),
+            codex_service_tier: "default".into(),
             prompt_addendum: String::new(),
             lan_control_enabled: false,
             lan_control_port: 18765,
@@ -333,6 +339,18 @@ fn update_config(
     }
     if !(5..=600).contains(&config.codex_timeout_seconds) {
         return Err("Codex 超时必须在 5 到 600 秒之间".into());
+    }
+    if !matches!(
+        config.codex_reasoning_effort.as_str(),
+        "" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    ) {
+        return Err(
+            "Codex 推理深度必须是自动、none、minimal、low、medium、high、xhigh、max 或 ultra"
+                .into(),
+        );
+    }
+    if !matches!(config.codex_service_tier.as_str(), "default" | "priority") {
+        return Err("Codex 速度模式必须是 default（标准）或 priority（Fast）".into());
     }
     if !(1024..=65535).contains(&config.lan_control_port) {
         return Err("本地控制端口必须在 1024 到 65535 之间".into());
@@ -710,6 +728,8 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
             state.work_dir.clone(),
             config.codex_path.clone(),
             config.codex_model.clone(),
+            config.codex_reasoning_effort.clone(),
+            config.codex_service_tier.clone(),
             config.codex_timeout_seconds,
             config.prompt_addendum.clone(),
         )

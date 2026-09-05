@@ -6,7 +6,7 @@ import {
 import { IconCheckCircle, IconClose, IconCopy, IconDelete, IconEdit, IconLoading, IconPause, IconPlayArrow, IconRefresh, IconSave, IconSettings, IconStop, IconUpload, IconPlus } from "@arco-design/web-react/icon";
 import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event";
-import type { Config, Preset, Snapshot } from "../ui_types";
+import type { CodexModelOption, Config, Preset, Snapshot } from "../ui_types";
 import type { PendingCommand } from "./context";
 import { useAppState } from "./context";
 
@@ -77,14 +77,21 @@ export function TaskPanel({ snapshot, pending, onCommand }: { snapshot: Snapshot
 }
 
 export function ProviderCard({ config, setConfig }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>> }) {
-  const [models, setModels] = useState<string[]>([]);
+  const [models, setModels] = useState<CodexModelOption[]>([]);
   const [loading, setLoading] = useState(false);
   const loadTimer = useRef<number | undefined>(undefined);
   const loadModels = async () => {
     if (config.provider !== "codex-cli") { setModels([]); return; }
     setLoading(true);
-    try { const result = await invoke<Array<string | { id?: string; model?: string; displayName?: string }>>("list_codex_models"); setModels(Array.isArray(result) ? result.map(item => typeof item === "string" ? item : item.id || item.model || item.displayName || "").filter(Boolean) : []); }
-    catch { setModels([]); }
+    try {
+      const result = await invoke<Array<CodexModelOption | string>>("list_codex_models");
+      const normalized = Array.isArray(result) ? result.map(item => {
+        if (typeof item === "string") return { id: item } as CodexModelOption;
+        const id = item.id || item.model || item.displayName || "";
+        return id ? { ...item, id } : null;
+      }).filter((item): item is CodexModelOption => Boolean(item?.id)) : [];
+      setModels(normalized);
+    } catch { setModels([]); }
     finally { setLoading(false); }
   };
   useEffect(() => {
@@ -92,14 +99,36 @@ export function ProviderCard({ config, setConfig }: { config: Config; setConfig:
     loadTimer.current = window.setTimeout(() => void loadModels(), 280);
     return () => window.clearTimeout(loadTimer.current);
   }, [config.provider, config.codex_path]);
+
+  const defaultModel = models.find(model => model.isDefault);
+  const selectedModel = models.find(model => model.id === config.codex_model) || (!config.codex_model ? defaultModel : undefined);
+  const fallbackReasoning = [
+    { reasoningEffort: "none", description: "最低延迟" },
+    { reasoningEffort: "minimal", description: "轻量推理" },
+    { reasoningEffort: "low", description: "较快" },
+    { reasoningEffort: "medium", description: "均衡" },
+    { reasoningEffort: "high", description: "深度" },
+    { reasoningEffort: "xhigh", description: "更深" },
+    { reasoningEffort: "max", description: "最大深度" },
+    { reasoningEffort: "ultra", description: "最大深度 + 自动委派" },
+  ];
+  const reasoningOptions = selectedModel?.supportedReasoningEfforts?.length ? selectedModel.supportedReasoningEfforts : fallbackReasoning;
+  const currentReasoning = config.codex_reasoning_effort || selectedModel?.defaultReasoningEffort || "low";
+  const reasoningKnown = reasoningOptions.some(option => option.reasoningEffort === currentReasoning);
+  const serviceTier = config.codex_service_tier || "default";
+  const fastSupported = !selectedModel || selectedModel.serviceTiers?.some(tier => tier.id === "priority" || tier.id === "fast") || selectedModel.additionalSpeedTiers?.includes("fast");
+  const modelLabel = selectedModel?.displayName || selectedModel?.id || "CLI 默认模型";
   return <Card className="panel-card" title={<span><IconSettings /> Provider 与模型</span>}>
     <div className="form-grid">
-      <label>答题 Provider<Select value={config.provider} onChange={v => setConfig(c => ({ ...c, provider: v }))}><Select.Option value="codex-cli">Codex CLI</Select.Option><Select.Option value="claude-code-cli">Claude Code CLI</Select.Option></Select></label>
+      <div className="form-field"><span className="field-label-text">答题 Provider</span><Select value={config.provider} onChange={v => setConfig(c => ({ ...c, provider: v }))}><Select.Option value="codex-cli">Codex CLI</Select.Option><Select.Option value="claude-code-cli">Claude Code CLI</Select.Option></Select></div>
       <label>CLI 路径<Input value={config.codex_path} onChange={v => setConfig(c => ({ ...c, codex_path: v }))} placeholder="codex 或 claude" /></label>
-      <label>模型<Select showSearch allowClear value={config.codex_model || undefined} loading={loading} onChange={v => setConfig(c => ({ ...c, codex_model: v ?? "" }))} placeholder={loading ? "正在读取模型…" : "选择模型"}>{models.map(m => <Select.Option key={m} value={m}>{m}</Select.Option>)}</Select></label>
+      <div className="form-field"><span className="field-label-text">模型</span><Select showSearch allowClear value={config.codex_model || undefined} loading={loading} onChange={v => setConfig(c => ({ ...c, codex_model: v ?? "" }))} placeholder={loading ? "正在读取模型…" : "选择模型"}>{models.map(model => <Select.Option key={model.id} value={model.id}>{model.displayName ? `${model.displayName} · ${model.id}` : model.id}</Select.Option>)}</Select></div>
+      <div className="form-field"><span className="field-label-text">推理深度</span><Select value={config.codex_reasoning_effort || "__default__"} onChange={v => setConfig(c => ({ ...c, codex_reasoning_effort: v === "__default__" ? "" : v }))}><Select.Option value="__default__">跟随模型默认（{selectedModel?.defaultReasoningEffort || "CLI"}）</Select.Option>{reasoningOptions.map(option => <Select.Option key={option.reasoningEffort} value={option.reasoningEffort}>{option.reasoningEffort}{option.description ? ` · ${option.description}` : ""}</Select.Option>)}{!reasoningKnown && config.codex_reasoning_effort ? <Select.Option value={config.codex_reasoning_effort}>{config.codex_reasoning_effort} · 当前配置</Select.Option> : null}</Select></div>
+      <div className="form-field"><span className="field-label-text">速度模式</span><Select value={serviceTier} onChange={v => setConfig(c => ({ ...c, codex_service_tier: v }))}><Select.Option value="default">标准 · 1×</Select.Option><Select.Option value="priority" disabled={Boolean(selectedModel && !fastSupported)}>Fast · 约 1.5×{selectedModel && !fastSupported ? "（当前模型不可用）" : ""}</Select.Option></Select></div>
       <label>超时（秒）<InputNumber min={10} max={3600} value={config.codex_timeout_seconds} onChange={v => setConfig(c => ({ ...c, codex_timeout_seconds: Number(v || 120) }))} /></label>
     </div>
-    <div className="current-value"><Tag color="green">当前生效 Provider：{config.provider === "codex-cli" ? "Codex CLI" : "Claude Code CLI"}</Tag><Tag color="arcoblue">当前模型：{config.codex_model || "CLI 默认"}</Tag></div>
+    <div className="provider-hint">已读取 {models.length || "当前"} 个 CLI 模型；当前模型：{modelLabel}。推理深度和速度层均来自模型目录，切换模型后候选会自动更新。Fast 使用 <code>service_tier=priority</code>，仅在模型/账号提供该层时可用。</div>
+    <div className="current-value"><Tag color="green">当前生效 Provider：{config.provider === "codex-cli" ? "Codex CLI" : "Claude Code CLI"}</Tag><Tag color="arcoblue">当前模型：{config.codex_model || modelLabel}</Tag><Tag color="arcoblue">推理：{config.codex_reasoning_effort || `模型默认（${currentReasoning}）`}</Tag><Tag color={serviceTier === "priority" ? "orange" : "gray"}>速度：{serviceTier === "priority" ? "Fast · 约 1.5×" : "标准 · 1×"}</Tag></div>
   </Card>;
 }
 
@@ -110,7 +139,7 @@ export function DisplayCard({ config, setConfig }: { config: Config; setConfig: 
   };
   return <Card className="panel-card" title={<span><IconSettings /> 浮窗显示</span>}>
     <div className="form-grid">
-      <label>主题<Select value={config.overlay_theme} onChange={v => setConfig(c => ({ ...c, overlay_theme: v }))}><Select.Option value="day">日间</Select.Option><Select.Option value="night">夜间</Select.Option><Select.Option value="follow">实时跟随</Select.Option></Select></label>
+      <div className="form-field"><span className="field-label-text">主题</span><Select value={config.overlay_theme} onChange={v => setConfig(c => ({ ...c, overlay_theme: v }))}><Select.Option value="day">日间</Select.Option><Select.Option value="night">夜间</Select.Option><Select.Option value="follow">实时跟随</Select.Option></Select></div>
       <label>窗口宽度<InputNumber min={280} max={1600} value={config.overlay_width} onChange={v => setConfig(c => ({ ...c, overlay_width: Number(v || 560) }))} /></label>
       <label>窗口高度<InputNumber min={160} max={1200} value={config.overlay_height} onChange={v => setConfig(c => ({ ...c, overlay_height: Number(v || 420) }))} /></label>
       <label>透明度 <span className="value-badge">{Math.round(config.overlay_opacity * 100)}%</span><Slider min={0.2} max={1} step={0.01} value={config.overlay_opacity} onChange={v => void update("overlay_opacity", Number(v))} /></label>

@@ -69,7 +69,10 @@ body, button, input, textarea, select { font-family: inherit; }
 
 /* Forms */
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-.form-grid label, .hotkey-grid label { display: flex; flex-direction: column; gap: 6px; color: var(--bb-muted); font-size: 12px; font-weight: 600; }
+.form-grid label, .form-grid .form-field, .hotkey-grid label { display: flex; flex-direction: column; gap: 6px; min-width: 0; color: var(--bb-muted); font-size: 12px; font-weight: 600; }
+.form-field > .arco-select, .form-field > .arco-input, .form-field > .arco-input-number { width: 100%; min-width: 0; display: block; }
+.form-field .arco-select-view { width: 100%; }
+.field-label-text { display: block; line-height: 1.35; }
 .form-grid label.switch-line, label.switch-line { flex-direction: row; align-items: center; justify-content: space-between; min-height: 36px; gap: 12px; }
 .form-grid label.switch-line .arco-switch, label.switch-line .arco-switch { flex: 0 0 auto; }
 .arco-input, .arco-input-number, .arco-input-number-input, .arco-input-inner-wrapper, .arco-select-view, .arco-textarea-wrapper { box-sizing: border-box; min-height: 36px; border-radius: 8px !important; border-color: var(--bb-border-strong) !important; color: var(--bb-text) !important; background: var(--bb-panel-2) !important; }
@@ -85,6 +88,8 @@ body, button, input, textarea, select { font-family: inherit; }
 .arco-switch-checked { background: var(--bb-primary) !important; }
 .arco-switch-dot { box-shadow: 0 2px 6px rgba(3, 8, 20, .25); }
 .value-badge { float: right; color: var(--bb-primary); font-size: 12px; font-variant-numeric: tabular-nums; }
+.provider-hint { margin-top: 12px; padding: 9px 11px; border: 1px solid var(--bb-border); border-radius: 8px; color: var(--bb-muted); background: var(--bb-primary-soft); font-size: 12px; line-height: 1.55; }
+.provider-hint code { color: var(--bb-text); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .current-value { margin-top: 14px; gap: 7px; }
 .hotkey-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 16px; }
 .hotkey-hint { margin: 13px 0; color: var(--bb-muted); font-size: 12px; }

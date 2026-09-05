@@ -25,6 +25,8 @@ const fallbackConfig: Config = {
   overlay_height: 420,
   codex_timeout_seconds: 120,
   codex_model: "",
+  codex_reasoning_effort: "low",
+  codex_service_tier: "default",
   prompt_addendum: "",
   lan_control_enabled: false,
   lan_control_port: 18765,
@@ -114,7 +116,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const patch: Record<string, unknown> = {};
     const scalarFields: (keyof Config)[] = [
       "provider", "codex_path", "overlay_opacity", "overlay_theme", "overlay_font_size",
-      "overlay_width", "overlay_height", "codex_timeout_seconds", "codex_model",
+      "overlay_width", "overlay_height", "codex_timeout_seconds", "codex_model", "codex_reasoning_effort", "codex_service_tier",
       "prompt_addendum", "lan_control_enabled", "lan_control_port", "mobile_auto_save_images",
     ];
     scalarFields.forEach(field => { if (config[field] !== baseline[field]) patch[field] = config[field]; });

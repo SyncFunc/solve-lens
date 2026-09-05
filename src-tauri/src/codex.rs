@@ -17,6 +17,8 @@ pub struct CodexCliProvider {
     work_dir: PathBuf,
     configured_path: String,
     model: String,
+    reasoning_effort: String,
+    service_tier: String,
     timeout_seconds: u64,
     prompt_addendum: String,
 }
@@ -24,6 +26,24 @@ pub struct CodexCliProvider {
 /// A model advertised by the locally installed Codex CLI.  The app-server
 /// catalog is authoritative for the current account and CLI version, so the
 /// UI does not need to ship a stale hard-coded model list.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningOption {
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexServiceTierOption {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexModelOption {
@@ -38,6 +58,14 @@ pub struct CodexModelOption {
     pub is_default: bool,
     #[serde(default)]
     pub hidden: bool,
+    #[serde(default)]
+    pub supported_reasoning_efforts: Vec<CodexReasoningOption>,
+    #[serde(default)]
+    pub default_reasoning_effort: String,
+    #[serde(default)]
+    pub additional_speed_tiers: Vec<String>,
+    #[serde(default)]
+    pub service_tiers: Vec<CodexServiceTierOption>,
 }
 
 struct CodexLaunch {
@@ -50,6 +78,8 @@ impl CodexCliProvider {
         work_dir: PathBuf,
         configured_path: String,
         model: String,
+        reasoning_effort: String,
+        service_tier: String,
         timeout_seconds: u64,
         prompt_addendum: String,
     ) -> Self {
@@ -57,6 +87,8 @@ impl CodexCliProvider {
             work_dir,
             configured_path,
             model,
+            reasoning_effort,
+            service_tier,
             timeout_seconds,
             prompt_addendum,
         }
@@ -263,6 +295,20 @@ impl CodexCliProvider {
         if !self.model.trim().is_empty() {
             command.args(["--model"]).arg(self.model.trim());
         }
+        // Codex CLI exposes these controls through its generic --config
+        // override. Keeping them per invocation prevents the app from
+        // mutating the user's global ~/.codex/config.toml.
+        if !self.reasoning_effort.trim().is_empty() {
+            command.args(["--config"]).arg(config_override(
+                "model_reasoning_effort",
+                &self.reasoning_effort,
+            ));
+        }
+        if !self.service_tier.trim().is_empty() {
+            command
+                .args(["--config"])
+                .arg(config_override("service_tier", &self.service_tier));
+        }
         for image in &draft.images {
             command.args(["--image"]).arg(&image.path);
         }
@@ -364,6 +410,13 @@ impl CodexCliProvider {
 struct ModelListPage {
     data: Vec<CodexModelOption>,
     next_cursor: Option<String>,
+}
+
+fn config_override(key: &str, value: &str) -> String {
+    // Values are validated by AppConfig before a solve starts. Strip quotes as
+    // an extra guard because --config parses the value as TOML.
+    let sanitized = value.trim().replace('"', "");
+    format!(r#"{key}="{sanitized}""#)
 }
 
 fn terminate_process(child: &mut Child, pid: u32) {
@@ -544,5 +597,17 @@ mod tests {
     fn keeps_plain_provider_text_unchanged() {
         let answer = parse_cli_jsonl("最终答案：42\n").unwrap();
         assert_eq!(answer.text, "最终答案：42");
+    }
+
+    #[test]
+    fn formats_codex_config_override_as_toml_string() {
+        assert_eq!(
+            config_override("service_tier", "priority"),
+            r#"service_tier="priority""#
+        );
+        assert_eq!(
+            config_override("model_reasoning_effort", "high\""),
+            r#"model_reasoning_effort="high""#
+        );
     }
 }
