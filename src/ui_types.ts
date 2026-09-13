@@ -34,10 +34,12 @@ export type CodexModelOption = {
   additionalSpeedTiers?: string[];
   serviceTiers?: CodexServiceTierOption[];
 };
+export type CodexThreadOption = { id: string; name?: string; model?: string; updatedAt?: string; archived?: boolean };
 
 export type Config = {
   provider: string;
   codex_path: string;
+  codex_execution_mode: "exec" | "interactive";
   overlay_opacity: number;
   overlay_theme: string;
   overlay_font_size: number;
@@ -65,6 +67,7 @@ export type Snapshot = {
   draft?: Draft;
   answer?: { text: string };
   answer_page: number;
+  interactive_thread_id?: string;
 
   presets: Preset[];
   status: string;

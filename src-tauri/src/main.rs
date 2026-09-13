@@ -13,7 +13,7 @@ mod overlay;
 mod presets;
 
 use crate::{
-    codex::{CodexCliProvider, CodexModelOption},
+    codex::{CodexCliProvider, CodexModelOption, CodexThreadOption, InteractiveCodexProvider, InteractiveTurnControl},
     domain::{AnswerResult, DraftView, PromptPreset, QuestionDraft},
     history::HistoryStore,
     presets::built_in_presets,
@@ -49,6 +49,9 @@ struct Inner {
     /// True when the user explicitly hid the overlay; background actions must not pop it back.
     overlay_user_hidden: bool,
     active_pid: Option<u32>,
+    active_interactive_turn: Option<Arc<InteractiveTurnControl>>,
+    interactive_thread_id: Option<String>,
+    interactive_thread_user_selected: bool,
     stream_output: String,
     answer_page: usize,
 }
@@ -104,6 +107,7 @@ impl Default for HotkeyConfig {
 struct AppConfig {
     provider: String,
     codex_path: String,
+    codex_execution_mode: String,
     overlay_opacity: f32,
     overlay_theme: String,
     overlay_font_size: u32,
@@ -127,6 +131,7 @@ impl Default for AppConfig {
         Self {
             provider: "codex-cli".into(),
             codex_path: String::new(),
+            codex_execution_mode: "exec".into(),
             overlay_opacity: 0.70,
             overlay_theme: "follow".into(),
             overlay_font_size: 18,
@@ -151,6 +156,7 @@ pub(crate) struct AppState {
     presets_path: PathBuf,
     config: Mutex<AppConfig>,
     config_path: PathBuf,
+    interactive_session_path: PathBuf,
     work_dir: PathBuf,
     history: HistoryStore,
     local_server: Mutex<Option<local_server::LocalServer>>,
@@ -169,6 +175,7 @@ struct Snapshot {
     message: Option<String>,
     stream_output: String,
     answer_page: usize,
+    interactive_thread_id: Option<String>,
     config: AppConfig,
 }
 
@@ -235,6 +242,7 @@ impl AppState {
             message: inner.message.clone(),
             stream_output: inner.stream_output.clone(),
             answer_page: inner.answer_page,
+            interactive_thread_id: inner.interactive_thread_id.clone(),
             config: self.config.lock().expect("config lock").clone(),
         }
     }
@@ -260,6 +268,17 @@ impl AppState {
         let content = serde_json::to_vec_pretty(&saved).map_err(|error| error.to_string())?;
         fs::write(&self.presets_path, content).map_err(|error| error.to_string())
     }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct StoredInteractiveSession { thread_id: Option<String> }
+
+fn load_interactive_thread(path: &PathBuf) -> Option<String> {
+    fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<StoredInteractiveSession>(&bytes).ok()).and_then(|value| value.thread_id)
+}
+
+fn persist_interactive_thread(state: &AppState, thread_id: Option<String>) -> Result<(), String> {
+    fs::write(&state.interactive_session_path, serde_json::to_vec_pretty(&StoredInteractiveSession { thread_id }).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
 }
 
 fn load_config(path: &PathBuf) -> AppConfig {
@@ -322,6 +341,9 @@ fn update_config(
         .clone();
     if !matches!(config.provider.as_str(), "codex-cli" | "claude-code-cli") {
         return Err("未知 Provider，请选择 Codex CLI 或 Claude Code CLI".into());
+    }
+    if !matches!(config.codex_execution_mode.as_str(), "exec" | "interactive") {
+        return Err("Codex 执行模式必须是 exec 或 interactive".into());
     }
     if !config.overlay_opacity.is_finite() || !(0.05..=0.95).contains(&config.overlay_opacity) {
         return Err("前台背景不透明度必须在 0.05 到 0.95 之间".into());
@@ -549,6 +571,27 @@ fn list_codex_models(state: State<'_, Arc<AppState>>) -> Result<Vec<CodexModelOp
     .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn list_codex_threads(state: State<'_, Arc<AppState>>, include_archived: Option<bool>) -> Result<Vec<CodexThreadOption>, String> {
+    let config = state.config.lock().map_err(|_| "config state unavailable")?.clone();
+    if config.provider != "codex-cli" { return Err("当前 Provider 不是 Codex CLI".into()); }
+    InteractiveCodexProvider::new(state.work_dir.clone(), config.codex_path, config.codex_model, config.codex_reasoning_effort, config.codex_service_tier, config.codex_timeout_seconds, config.prompt_addendum)
+        .list_threads(include_archived.unwrap_or(false)).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn select_codex_thread(app: AppHandle, state: State<'_, Arc<AppState>>, thread_id: String) -> Result<(), String> {
+    if thread_id.trim().is_empty() { return Err("threadId 不能为空".into()); }
+    let mut inner = state.inner.lock().map_err(|_| "application state unavailable")?;
+    if inner.status == "solving" { return Err("任务进行中，不能切换会话".into()); }
+    inner.interactive_thread_id = (thread_id != "new").then(|| thread_id.trim().to_owned());
+    inner.interactive_thread_user_selected = thread_id != "new";
+    persist_interactive_thread(&state, inner.interactive_thread_id.clone())?;
+    drop(inner);
+    emit_snapshot(&app, &state);
+    Ok(())
+}
+
 pub(crate) fn dispatch_remote_command(
     app: AppHandle,
     id: String,
@@ -668,6 +711,14 @@ fn capture_for_preset(
 }
 #[tauri::command]
 fn clear_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let (thread_id, config) = {
+        let inner = state.inner.lock().map_err(|_| "application state unavailable")?;
+        (inner.interactive_thread_id.clone(), state.config.lock().map_err(|_| "config state unavailable")?.clone())
+    };
+    if let Some(thread_id) = thread_id {
+        InteractiveCodexProvider::new(state.work_dir.clone(), config.codex_path, config.codex_model, config.codex_reasoning_effort, config.codex_service_tier, config.codex_timeout_seconds, config.prompt_addendum)
+            .archive(&thread_id).map_err(|error| format!("无法归档交互会话，草稿未清空：{error}"))?;
+    }
     let mut inner = state
         .inner
         .lock()
@@ -679,9 +730,11 @@ fn clear_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), St
     inner.answer_preset_id = None;
     inner.stream_output.clear();
     inner.answer_page = 0;
+    inner.interactive_thread_id = None;
     inner.status = "idle".into();
     inner.message = Some("草稿已清空".into());
     drop(inner);
+    persist_interactive_thread(&state, None)?;
     emit_snapshot(&app, &state);
     Ok(())
 }
@@ -724,35 +777,56 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         let pid_state = process_state.clone();
         let progress_state = process_state.clone();
 
-        let result = CodexCliProvider::new(
-            state.work_dir.clone(),
-            config.codex_path.clone(),
-            config.codex_model.clone(),
-            config.codex_reasoning_effort.clone(),
-            config.codex_service_tier.clone(),
-            config.codex_timeout_seconds,
-            config.prompt_addendum.clone(),
-        )
-        .solve(
-            &draft,
-            &preset,
-            move |pid| {
-                pid_state
-                    .inner
-                    .lock()
-                    .expect("application state lock")
-                    .active_pid = Some(pid);
-            },
-            move |_line| {
-                // The product intentionally renders only the final plain-text
-                // answer. Avoid retaining/emitting every provider line so a
-                // long solve cannot flood the UI or LAN connection.
-                let mut inner = progress_state.inner.lock().expect("application state lock");
-                if inner.status == "solving" {
-                    inner.message = Some("正在处理 Codex 输出".into());
+        let result = if config.codex_execution_mode == "interactive" {
+            let (existing_thread, strict_resume) = { let inner = state.inner.lock().expect("application state lock"); (inner.interactive_thread_id.clone(), inner.interactive_thread_user_selected) };
+            let thread_state = state.clone();
+            let control_state = state.clone();
+            let fallback_pid_state = state.clone();
+            let fallback_progress_state = state.clone();
+            InteractiveCodexProvider::new(
+                state.work_dir.clone(), config.codex_path.clone(), config.codex_model.clone(),
+                config.codex_reasoning_effort.clone(), config.codex_service_tier.clone(),
+                config.codex_timeout_seconds, config.prompt_addendum.clone(),
+            ).solve(
+                existing_thread, strict_resume, &draft, &preset,
+                move |pid| { pid_state.inner.lock().expect("application state lock").active_pid = Some(pid); },
+                move |thread_id| {
+                    thread_state.inner.lock().expect("application state lock").interactive_thread_id = Some(thread_id.clone());
+                    let _ = persist_interactive_thread(&thread_state, Some(thread_id));
+                },
+                move |control| { control_state.inner.lock().expect("application state lock").active_interactive_turn = Some(control); },
+            ).or_else(|interactive_error| {
+                // A broken app-server must not make the existing single-question
+                // provider unavailable. Keep the saved thread id for a later
+                // resume attempt and make the fallback visible in state.
+                if let Ok(mut inner) = state.inner.lock() {
+                    inner.active_interactive_turn = None;
+                    inner.message = Some(format!("交互模式异常，已安全降级到单题模式：{interactive_error}"));
                 }
-            },
-        );
+                CodexCliProvider::new(
+                    state.work_dir.clone(), config.codex_path.clone(), config.codex_model.clone(),
+                    config.codex_reasoning_effort.clone(), config.codex_service_tier.clone(),
+                    config.codex_timeout_seconds, config.prompt_addendum.clone(),
+                ).solve(
+                    &draft, &preset,
+                    move |pid| { fallback_pid_state.inner.lock().expect("application state lock").active_pid = Some(pid); },
+                    move |_line| { if let Ok(mut inner) = fallback_progress_state.inner.lock() { if inner.status == "solving" { inner.message = Some("交互模式不可用，正在通过单题模式求解".into()); } } },
+                )
+            })
+        } else {
+            CodexCliProvider::new(
+                state.work_dir.clone(), config.codex_path.clone(), config.codex_model.clone(),
+                config.codex_reasoning_effort.clone(), config.codex_service_tier.clone(),
+                config.codex_timeout_seconds, config.prompt_addendum.clone(),
+            ).solve(
+                &draft, &preset,
+                move |pid| { pid_state.inner.lock().expect("application state lock").active_pid = Some(pid); },
+                move |_line| {
+                    let mut inner = progress_state.inner.lock().expect("application state lock");
+                    if inner.status == "solving" { inner.message = Some("正在处理 Codex 输出".into()); }
+                },
+            )
+        };
         let mut inner = state.inner.lock().expect("application state lock");
         let was_cancelled = inner.status == "cancelled" && inner.active_pid.is_none();
         if was_cancelled {
@@ -791,6 +865,7 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
             }
         }
         inner.active_pid = None;
+        inner.active_interactive_turn = None;
         drop(inner);
         emit_snapshot(&app, &state);
     });
@@ -799,20 +874,28 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
 
 #[tauri::command]
 fn cancel_current_job(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let pid = {
+    let (pid, interactive) = {
         let mut inner = state
             .inner
             .lock()
             .map_err(|_| "application state unavailable")?;
         inner.status = "cancelled".into();
         inner.message = Some("已取消任务".into());
-        inner.active_pid.take()
+        (inner.active_pid.take(), inner.active_interactive_turn.clone())
     };
-    if let Some(pid) = pid {
+    let is_interactive = interactive.is_some();
+    if let Some(control) = interactive {
+        if let Err(error) = control.interrupt() {
+            // Preserve the thread even if the process is already gone; the next
+            // submit will resume it or safely fall back to exec.
+            if let Ok(mut inner) = state.inner.lock() { inner.message = Some(format!("取消请求未送达 app-server：{error}")); }
+        }
+    }
+    if !is_interactive { if let Some(pid) = pid {
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
-    }
+    } }
     emit_snapshot(&app, &state);
     Ok(())
 }
@@ -1101,15 +1184,19 @@ fn main() {
                 }
             };
             let config_path = data_dir.join("config.json");
+            let interactive_session_path = data_dir.join("interactive-session.json");
+            let interactive_thread_id = load_interactive_thread(&interactive_session_path);
             let state = Arc::new(AppState {
                 inner: Mutex::new(Inner {
                     status: "idle".into(),
+                    interactive_thread_id,
                     ..Default::default()
                 }),
                 presets: Mutex::new(load_presets(&data_dir.join("presets.json"))),
                 presets_path: data_dir.join("presets.json"),
                 config: Mutex::new(load_config(&config_path)),
                 config_path,
+                interactive_session_path,
                 work_dir,
                 history,
                 local_server: Mutex::new(None),
@@ -1236,6 +1323,8 @@ fn main() {
             set_overlay_opacity,
             sample_overlay_background,
             list_codex_models
+            ,list_codex_threads,
+            select_codex_thread
         ])
         .run(tauri::generate_context!())
         .expect("宝宝巴士启动失败");

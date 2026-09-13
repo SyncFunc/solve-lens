@@ -18,6 +18,7 @@ export type UiState = {
 const fallbackConfig: Config = {
   provider: "codex-cli",
   codex_path: "codex",
+  codex_execution_mode: "exec",
   overlay_opacity: 0.86,
   overlay_theme: "follow",
   overlay_font_size: 20,
@@ -115,7 +116,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const baseline = snapshot.config;
     const patch: Record<string, unknown> = {};
     const scalarFields: (keyof Config)[] = [
-      "provider", "codex_path", "overlay_opacity", "overlay_theme", "overlay_font_size",
+      "provider", "codex_path", "codex_execution_mode", "overlay_opacity", "overlay_theme", "overlay_font_size",
       "overlay_width", "overlay_height", "codex_timeout_seconds", "codex_model", "codex_reasoning_effort", "codex_service_tier",
       "prompt_addendum", "lan_control_enabled", "lan_control_port", "mobile_auto_save_images",
     ];

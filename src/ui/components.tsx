@@ -6,12 +6,21 @@ import {
 import { IconCheckCircle, IconClose, IconCopy, IconDelete, IconEdit, IconLoading, IconPause, IconPlayArrow, IconRefresh, IconSave, IconSettings, IconStop, IconUpload, IconPlus } from "@arco-design/web-react/icon";
 import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event";
-import type { CodexModelOption, Config, Preset, Snapshot } from "../ui_types";
+import type { CodexModelOption, CodexThreadOption, Config, Preset, Snapshot } from "../ui_types";
 import type { PendingCommand } from "./context";
 import { useAppState } from "./context";
 
 const { Row, Col } = Grid;
 const { Title, Text, Paragraph } = Typography;
+
+function formatThreadDate(value?: string) {
+  if (!value) return "";
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric < 1e12 ? numeric * 1000 : numeric)
+    : new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
+}
 
 export function ToastView({ toast }: { toast?: { level: "info" | "success" | "error"; text: string } }) {
   if (!toast) return null;
@@ -67,7 +76,7 @@ export function TaskPanel({ snapshot, pending, onCommand }: { snapshot: Snapshot
       <div className="task-actions">
         <ActionButton type="primary" loading={pending?.kind === "capture"} disabled={busy} onClick={() => onCommand("capture", "capture_for_preset", { presetId: selected })}><IconUpload /> 截图加入</ActionButton>
         <ActionButton type="primary" loading={pending?.kind === "submit"} disabled={busy || !snapshot.draft?.image_count} onClick={() => onCommand("submit", "submit_draft")}><IconPlayArrow /> 提交解题</ActionButton>
-        <ActionButton loading={pending?.kind === "clear"} disabled={busy || !snapshot.draft} onClick={() => onCommand("clear", "clear_draft")}><IconDelete /> 清空</ActionButton>
+        <ActionButton loading={pending?.kind === "clear"} disabled={busy || (!snapshot.draft && !snapshot.interactive_thread_id)} onClick={() => onCommand("clear", "clear_draft")}><IconDelete /> 清空</ActionButton>
         <ActionButton loading={pending?.kind === "cancel"} disabled={busy} onClick={() => onCommand("cancel", "cancel_current_job")}><IconStop /> 取消</ActionButton>
       </div>
       {snapshot.message && <Alert type={snapshot.status === "error" || snapshot.status === "failed" ? "error" : "info"} content={snapshot.message} showIcon />}
@@ -76,9 +85,13 @@ export function TaskPanel({ snapshot, pending, onCommand }: { snapshot: Snapshot
   </Card>;
 }
 
-export function ProviderCard({ config, setConfig }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>> }) {
+export function ProviderCard({ config, setConfig, threadId }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; threadId?: string }) {
+  const { snapshot } = useAppState();
   const [models, setModels] = useState<CodexModelOption[]>([]);
   const [loading, setLoading] = useState(false);
+  const [threads, setThreads] = useState<CodexThreadOption[]>([]);
+  const [threadsLoading, setThreadsLoading] = useState(false);
+  const [threadsError, setThreadsError] = useState<string | undefined>(undefined);
   const loadTimer = useRef<number | undefined>(undefined);
   const loadModels = async () => {
     if (config.provider !== "codex-cli") { setModels([]); return; }
@@ -99,6 +112,15 @@ export function ProviderCard({ config, setConfig }: { config: Config; setConfig:
     loadTimer.current = window.setTimeout(() => void loadModels(), 280);
     return () => window.clearTimeout(loadTimer.current);
   }, [config.provider, config.codex_path]);
+  useEffect(() => {
+    if (config.provider !== "codex-cli" || config.codex_execution_mode !== "interactive") { setThreads([]); setThreadsError(undefined); return; }
+    setThreadsLoading(true);
+    setThreadsError(undefined);
+    invoke<CodexThreadOption[]>("list_codex_threads", { includeArchived: false })
+      .then(value => setThreads(Array.isArray(value) ? value : []))
+      .catch(error => { setThreads([]); setThreadsError(String(error)); })
+      .finally(() => setThreadsLoading(false));
+  }, [config.provider, config.codex_execution_mode, config.codex_path]);
 
   const defaultModel = models.find(model => model.isDefault);
   const selectedModel = models.find(model => model.id === config.codex_model) || (!config.codex_model ? defaultModel : undefined);
@@ -121,13 +143,15 @@ export function ProviderCard({ config, setConfig }: { config: Config; setConfig:
   return <Card className="panel-card" title={<span><IconSettings /> Provider 与模型</span>}>
     <div className="form-grid">
       <div className="form-field"><span className="field-label-text">答题 Provider</span><Select value={config.provider} onChange={v => setConfig(c => ({ ...c, provider: v }))}><Select.Option value="codex-cli">Codex CLI</Select.Option><Select.Option value="claude-code-cli">Claude Code CLI</Select.Option></Select></div>
+      {config.provider === "codex-cli" ? <div className="form-field"><span className="field-label-text">执行模式</span><Select value={config.codex_execution_mode} onChange={v => setConfig(c => ({ ...c, codex_execution_mode: v as "exec" | "interactive" }))}><Select.Option value="exec">单题 exec（默认）</Select.Option><Select.Option value="interactive">连续上下文 interactive</Select.Option></Select></div> : null}
+      {config.provider === "codex-cli" && config.codex_execution_mode === "interactive" ? <div className="form-field"><span className="field-label-text">已有会话</span><Select showSearch allowClear loading={threadsLoading} value={threadId || snapshot.interactive_thread_id} onChange={v => { if (v === "__new__") { void invoke("select_codex_thread", { threadId: "new" }); } else if (v) void invoke("select_codex_thread", { threadId: v }); }} placeholder={threadsLoading ? "正在读取会话…" : threadsError ? "会话读取失败" : threads.length ? "选择已有 Codex 会话" : "暂无可用会话"}><Select.Option value="__new__">新建会话（提交时自动创建）</Select.Option>{threads.map(thread => <Select.Option key={thread.id} value={thread.id}>{thread.name || thread.id}{formatThreadDate(thread.updatedAt) ? ` · ${formatThreadDate(thread.updatedAt)}` : ""}</Select.Option>)}</Select>{threadsError ? <Alert type="error" showIcon content={<span>读取 Codex 会话失败：<code>{threadsError}</code></span>} /> : !threadsLoading && !threads.length ? <div className="provider-hint">当前没有可列出的未归档会话。</div> : null}</div> : null}
       <label>CLI 路径<Input value={config.codex_path} onChange={v => setConfig(c => ({ ...c, codex_path: v }))} placeholder="codex 或 claude" /></label>
       <div className="form-field"><span className="field-label-text">模型</span><Select showSearch allowClear value={config.codex_model || undefined} loading={loading} onChange={v => setConfig(c => ({ ...c, codex_model: v ?? "" }))} placeholder={loading ? "正在读取模型…" : "选择模型"}>{models.map(model => <Select.Option key={model.id} value={model.id}>{model.displayName ? `${model.displayName} · ${model.id}` : model.id}</Select.Option>)}</Select></div>
       <div className="form-field"><span className="field-label-text">推理深度</span><Select value={config.codex_reasoning_effort || "__default__"} onChange={v => setConfig(c => ({ ...c, codex_reasoning_effort: v === "__default__" ? "" : v }))}><Select.Option value="__default__">跟随模型默认（{selectedModel?.defaultReasoningEffort || "CLI"}）</Select.Option>{reasoningOptions.map(option => <Select.Option key={option.reasoningEffort} value={option.reasoningEffort}>{option.reasoningEffort}{option.description ? ` · ${option.description}` : ""}</Select.Option>)}{!reasoningKnown && config.codex_reasoning_effort ? <Select.Option value={config.codex_reasoning_effort}>{config.codex_reasoning_effort} · 当前配置</Select.Option> : null}</Select></div>
       <div className="form-field"><span className="field-label-text">速度模式</span><Select value={serviceTier} onChange={v => setConfig(c => ({ ...c, codex_service_tier: v }))}><Select.Option value="default">标准 · 1×</Select.Option><Select.Option value="priority" disabled={Boolean(selectedModel && !fastSupported)}>Fast · 约 1.5×{selectedModel && !fastSupported ? "（当前模型不可用）" : ""}</Select.Option></Select></div>
       <label>超时（秒）<InputNumber min={10} max={3600} value={config.codex_timeout_seconds} onChange={v => setConfig(c => ({ ...c, codex_timeout_seconds: Number(v || 120) }))} /></label>
     </div>
-    <div className="provider-hint">已读取 {models.length || "当前"} 个 CLI 模型；当前模型：{modelLabel}。推理深度和速度层均来自模型目录，切换模型后候选会自动更新。Fast 使用 <code>service_tier=priority</code>，仅在模型/账号提供该层时可用。</div>
+    <div className="provider-hint">已读取 {models.length || "当前"} 个 CLI 模型；当前模型：{modelLabel}。{config.codex_execution_mode === "interactive" ? "交互模式会保留 Codex thread，上下文仅在清空时归档。" : "单题模式每次独立执行。"} Fast 使用 <code>service_tier=priority</code>，仅在模型/账号提供该层时可用。</div>
     <div className="current-value"><Tag color="green">当前生效 Provider：{config.provider === "codex-cli" ? "Codex CLI" : "Claude Code CLI"}</Tag><Tag color="arcoblue">当前模型：{config.codex_model || modelLabel}</Tag><Tag color="arcoblue">推理：{config.codex_reasoning_effort || `模型默认（${currentReasoning}）`}</Tag><Tag color={serviceTier === "priority" ? "orange" : "gray"}>速度：{serviceTier === "priority" ? "Fast · 约 1.5×" : "标准 · 1×"}</Tag></div>
   </Card>;
 }
