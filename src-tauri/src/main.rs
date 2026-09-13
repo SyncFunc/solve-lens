@@ -10,10 +10,12 @@ mod domain;
 mod history;
 mod local_server;
 mod overlay;
+mod openai;
 mod presets;
 
 use crate::{
     codex::{CodexCliProvider, CodexModelOption, CodexThreadOption, InteractiveCodexProvider, InteractiveTurnControl},
+    openai::OpenAiProvider,
     domain::{AnswerResult, DraftView, PromptPreset, QuestionDraft},
     history::HistoryStore,
     presets::built_in_presets,
@@ -108,6 +110,9 @@ struct AppConfig {
     provider: String,
     codex_path: String,
     codex_execution_mode: String,
+    openai_base_url: String,
+    openai_api_key: String,
+    openai_model: String,
     overlay_opacity: f32,
     overlay_theme: String,
     overlay_font_size: u32,
@@ -132,6 +137,9 @@ impl Default for AppConfig {
             provider: "codex-cli".into(),
             codex_path: String::new(),
             codex_execution_mode: "exec".into(),
+            openai_base_url: "https://api.openai.com".into(),
+            openai_api_key: String::new(),
+            openai_model: "gpt-4o-mini".into(),
             overlay_opacity: 0.70,
             overlay_theme: "follow".into(),
             overlay_font_size: 18,
@@ -339,8 +347,8 @@ fn update_config(
         .lock()
         .map_err(|_| "config state unavailable")?
         .clone();
-    if !matches!(config.provider.as_str(), "codex-cli" | "claude-code-cli") {
-        return Err("未知 Provider，请选择 Codex CLI 或 Claude Code CLI".into());
+    if !matches!(config.provider.as_str(), "codex-cli" | "claude-code-cli" | "openai-api") {
+        return Err("未知 Provider，请选择 Codex CLI、OpenAI API 或 Claude Code CLI".into());
     }
     if !matches!(config.codex_execution_mode.as_str(), "exec" | "interactive") {
         return Err("Codex 执行模式必须是 exec 或 interactive".into());
@@ -715,9 +723,14 @@ fn clear_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), St
         let inner = state.inner.lock().map_err(|_| "application state unavailable")?;
         (inner.interactive_thread_id.clone(), state.config.lock().map_err(|_| "config state unavailable")?.clone())
     };
-    if let Some(thread_id) = thread_id {
+    // OpenAI API is stateless per request. A previously selected Codex
+    // interactive thread must never be archived while another Provider is
+    // active (especially after switching to OpenAI API mode).
+    if config.provider == "codex-cli" && config.codex_execution_mode == "interactive" {
+        if let Some(thread_id) = thread_id {
         InteractiveCodexProvider::new(state.work_dir.clone(), config.codex_path, config.codex_model, config.codex_reasoning_effort, config.codex_service_tier, config.codex_timeout_seconds, config.prompt_addendum)
             .archive(&thread_id).map_err(|error| format!("无法归档交互会话，草稿未清空：{error}"))?;
+        }
     }
     let mut inner = state
         .inner
@@ -747,6 +760,18 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         .map_err(|_| "config state unavailable")?
         .provider
         .clone();
+    if provider == "openai-api" {
+        let (draft, preset) = { let mut inner = state.inner.lock().map_err(|_| "application state unavailable")?; if inner.status == "solving" { return Err("已有任务正在求解".into()); } let draft = inner.draft.clone().ok_or("请先添加至少一张截图")?; let preset = state.preset(&draft.preset_id)?; inner.status = "solving".into(); inner.message = Some("正在通过 OpenAI API 求解".into()); (draft, preset) };
+        emit_snapshot(&app, &state);
+        let config = state.config.lock().map_err(|_| "config state unavailable")?.clone(); let state = state.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let result = OpenAiProvider { base_url: config.openai_base_url, api_key: config.openai_api_key, model: config.openai_model, timeout_seconds: config.codex_timeout_seconds, prompt_addendum: config.prompt_addendum }.solve(&draft, &preset);
+            let mut inner = state.inner.lock().expect("application state lock");
+            match result { Ok(answer) => { remove_draft_images(&draft); inner.answer = Some(answer); inner.draft = None; inner.status = "displaying".into(); inner.message = Some("答案已生成".into()); }, Err(error) => { remove_draft_images(&draft); inner.draft = None; inner.status = "failed".into(); inner.message = Some(format!("OpenAI 求解失败：{error}")); } }
+            drop(inner); emit_snapshot(&app, &state);
+        });
+        return Ok(());
+    }
     if provider != "codex-cli" {
         return Err(format!("{provider} provider 尚未接入求解适配器"));
     }

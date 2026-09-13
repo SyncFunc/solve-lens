@@ -40,6 +40,9 @@ export type Config = {
   provider: string;
   codex_path: string;
   codex_execution_mode: "exec" | "interactive";
+  openai_base_url: string;
+  openai_api_key: string;
+  openai_model: string;
   overlay_opacity: number;
   overlay_theme: string;
   overlay_font_size: number;
