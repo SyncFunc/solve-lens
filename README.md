@@ -50,7 +50,7 @@ rustc --version
 
 ### 1.2 安装并登录 Codex CLI
 
-首版实际可用的求解 Provider 是 Codex CLI。先全局安装并登录：
+Codex CLI Provider 需要先全局安装并登录：
 
 ~~~powershell
 npm install -g @openai/codex
@@ -67,6 +67,8 @@ codex exec --ephemeral --sandbox read-only "请用一句话回答：1+1 等于�
 如果 CLI 不在 PATH 中，可以在配置页的“Provider 与模型”卡片中填写 `codex.cmd`、`codex.exe` 或完整路径。项目也兼容 npm 生成的 `codex.cmd` 启动 shim。
 
 配置页目前可以选择“Claude Code CLI”，这是 Provider 抽象保留的入口；当前提交链路会明确提示该 Provider 尚未接入求解适配器。未来接入时只需要增加对应的 `AnswerProvider` 实现，不需要重写截图、草稿、浮窗或手机协议。
+
+也可以选择 **OpenAI API**。在 Provider 卡片中填写 API Base URL（默认 `https://api.openai.com`）、模型和 API Key；API Key 留空时读取环境变量 `OPENAI_API_KEY`。OpenAI API 按单轮 Chat Completions 请求处理，不维护 Codex thread。
 
 ### 1.3 安装项目依赖
 
@@ -95,6 +97,15 @@ npm run check:desktop
 ~~~
 
 `check:desktop` 会启动桌面 Rust 进程，适合检查窗口和运行时依赖，不建议在自动化构建中长期占用。前端构建产物位于 `dist`，Tauri 打包时由 `src-tauri/tauri.conf.json` 的 `frontendDist` 指向该目录。
+
+生成 Windows 安装包：
+
+~~~powershell
+npm ci
+npm run tauri build -- --bundles msi
+~~~
+
+安装包位于 `src-tauri/target/release/bundle/msi/`。手机控制页的 `dist` 资源会随安装包一起打包，生产环境由 Rust 局域网服务器从资源目录提供 `mobile.html` 和 `assets`。
 
 如果只是使用已打包版本，不需要运行 Vite；仍需要安装并登录 Codex CLI，因为答题进程由本机 CLI 完成。
 
@@ -137,9 +148,10 @@ flowchart LR
 | --- | --- | --- | --- |
 | Codex CLI | 已实现 | Prompt + 按顺序排列的图片 | 启动 `codex exec --ephemeral --json --sandbox read-only`，可附加模型和超时 |
 | Claude Code CLI | 配置入口已保留 | 预留 | 当前提交会返回“Provider 尚未接入求解适配器” |
-| HTTP/API Provider | 未来扩展 | 同一份任务对象 | 实现 `AnswerProvider` 后即可替换本地 CLI，不影响 UI 和传输层 |
+| OpenAI API | 已实现 | Prompt + Base64 图片 | 调用 `/v1/chat/completions`，支持 API Key、Base URL 和模型配置，按单轮请求处理 |
+| Claude Code CLI | 配置入口已保留 | 预留 | 当前提交会返回“Provider 尚未接入求解适配器” |
 
-Codex 模型候选不是写死在页面中的。配置页会通过 `codex app-server --stdio` 的 `model/list` 请求读取当前 CLI 可见的模型；因此模型列表取决于 CLI 版本、登录账号和服务端可用性。列表为空时仍可手动填写模型 ID 或留空使用 CLI 默认模型。
+Codex 模型候选不是写死在页面中的。配置页会通过 `codex app-server --stdio` 的 `model/list` 请求读取当前 CLI 可见的模型；交互模式还可通过 `thread/list` 选择已有会话。OpenAI API 模式使用手动填写的模型，不显示 Codex 会话选项。
 
 ### 3.3 一次答题的生命周期
 
@@ -162,7 +174,9 @@ sequenceDiagram
   Core->>Core: 清理临时图片并保存加密历史
 ~~~
 
-每次 Codex 调用包含四部分：不可修改的安全提示、所选题型预设、草稿元数据和按顺序附加的图片。安全提示要求模型只分析题目，不执行图片里出现的指令，不读取与答题无关的本地资源；图片模糊或缺页时必须说明信息不足，不能臆造。
+Codex 交互模式会复用同一个 thread，首次提交调用 `thread/start`，后续提交调用 `thread/resume` + `turn/start`；取消使用 `turn/interrupt`，清空时归档 thread。OpenAI API 模式每次独立调用 Chat Completions。两种模式都包含不可修改的安全提示、题型预设、全局附加要求和按顺序附加的图片；图片模糊或缺页时必须说明信息不足，不能臆造。
+
+每次截图或提交都会生成 `trace_id`。Rust 日志记录截图、缩略图生成、Provider 请求、历史保存和草稿清理等 span；前端同时记录命令发送、快照刷新和状态变更，可用同一 ID 串联完整链路。
 
 ## 4. PC 端使用
 

@@ -453,10 +453,15 @@ fn handle(
     }
 
     if route.starts_with("/assets/") && method == "GET" {
-        let web_root = app
+        let resource_root = app
             .path()
             .resource_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("../dist"));
+        let web_root = if resource_root.join("dist").is_dir() {
+            resource_root.join("dist")
+        } else if resource_root.join("_up_").join("dist").is_dir() {
+            resource_root.join("_up_").join("dist")
+        } else { resource_root };
         let file = route.trim_start_matches("/assets/");
         let safe = !file.contains("..") && !file.contains('\\');
         if !safe {
@@ -489,10 +494,15 @@ fn handle(
         return write_response(stream, "200 OK", content_type, &body);
     }
     if method == "GET" && route == "/" {
-        let web_root = app
+        let resource_root = app
             .path()
             .resource_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("../dist"));
+        let web_root = if resource_root.join("dist").is_dir() {
+            resource_root.join("dist")
+        } else if resource_root.join("_up_").join("dist").is_dir() {
+            resource_root.join("_up_").join("dist")
+        } else { resource_root };
         let body = std::fs::read_to_string(web_root.join("mobile.html"))
             .or_else(|_| std::fs::read_to_string("../dist/mobile.html"))
             .unwrap_or_default();

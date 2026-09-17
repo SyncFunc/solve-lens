@@ -61,6 +61,10 @@ function commandId() {
   try { return crypto.randomUUID(); } catch { return `${Date.now()}-${Math.random()}`; }
 }
 
+function uiTrace(event: string, traceId: string | undefined, fields: Record<string, unknown> = {}) {
+  console.debug(JSON.stringify({ event, trace_id: traceId ?? null, ...fields }));
+}
+
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [snapshot, setSnapshot] = useState<Snapshot>(fallbackSnapshot);
   const [pending, setPending] = useState<PendingCommand | undefined>(undefined);
@@ -76,7 +80,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const refresh = useCallback(async () => {
     try {
       const next = await invoke<Snapshot>("get_snapshot");
-      if (next) setSnapshot(next);
+      if (next) { uiTrace("ui.snapshot", next.trace_id, { status: next.status }); setSnapshot(next); }
     } catch (error) {
       notify("error", String(error));
     }
@@ -87,7 +91,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     listen<Snapshot>("state-changed", (event) => {
-      if (!disposed && event.payload) setSnapshot(event.payload);
+      if (!disposed && event.payload) { uiTrace("ui.state.changed", event.payload.trace_id, { status: event.payload.status }); setSnapshot(event.payload); }
     }).then((fn) => {
       if (disposed) fn(); else unlisten = fn;
     }).catch(() => undefined);
@@ -101,10 +105,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const command = useCallback(async (kind: PendingCommand["kind"], name: string, args: Record<string, unknown> = {}) => {
     const beforeImageCount = snapshot.draft?.image_count ?? 0;
     const id = commandId();
+    uiTrace("ui.command.start", snapshot.trace_id, { command: name, kind, command_id: id });
     setPending({ id, kind, beforeImageCount });
     notify("info", kind === "capture" ? "正在发送截图请求" : "正在发送操作请求");
     try {
       await invoke(name, args);
+      uiTrace("ui.command.accepted", snapshot.trace_id, { command: name, kind, command_id: id });
       notify("info", "请求已发送，等待状态确认");
     } catch (error) {
       setPending(undefined);

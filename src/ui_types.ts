@@ -67,6 +67,7 @@ export type Draft = {
 };
 
 export type Snapshot = {
+  trace_id?: string;
   draft?: Draft;
   answer?: { text: string };
   answer_page: number;

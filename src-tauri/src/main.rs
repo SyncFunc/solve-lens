@@ -11,11 +11,13 @@ mod history;
 mod local_server;
 mod overlay;
 mod openai;
+mod trace;
 mod presets;
 
 use crate::{
     codex::{CodexCliProvider, CodexModelOption, CodexThreadOption, InteractiveCodexProvider, InteractiveTurnControl},
     openai::OpenAiProvider,
+    trace::TraceContext,
     domain::{AnswerResult, DraftView, PromptPreset, QuestionDraft},
     history::HistoryStore,
     presets::built_in_presets,
@@ -54,6 +56,7 @@ struct Inner {
     active_interactive_turn: Option<Arc<InteractiveTurnControl>>,
     interactive_thread_id: Option<String>,
     interactive_thread_user_selected: bool,
+    trace_id: Option<String>,
     stream_output: String,
     answer_page: usize,
 }
@@ -184,6 +187,7 @@ struct Snapshot {
     stream_output: String,
     answer_page: usize,
     interactive_thread_id: Option<String>,
+    trace_id: Option<String>,
     config: AppConfig,
 }
 
@@ -196,6 +200,7 @@ impl AppState {
             .expect("config lock")
             .mobile_auto_save_images;
         let mut draft_view = inner.draft.as_ref().map(DraftView::from);
+        let snapshot_trace_id = inner.trace_id.clone();
         if let Some(view) = draft_view.as_mut() {
             if let Some(draft) = inner.draft.as_ref() {
                 let mut cache = self.thumbnail_cache.lock().expect("thumbnail cache lock");
@@ -219,6 +224,8 @@ impl AppState {
                                 return Some(value.clone());
                             }
                         }
+                        let thumbnail_trace = TraceContext { trace_id: snapshot_trace_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()) };
+                        let thumbnail_span = thumbnail_trace.span("thumbnail.generate");
                         let bytes = fs::read(&image.path).ok()?;
                         let value = if full_images {
                             format!("data:image/png;base64,{}", BASE64.encode(bytes))
@@ -235,6 +242,7 @@ impl AppState {
                             )
                         };
                         cache.insert(image.path.clone(), (stamp, value.clone()));
+                        drop(thumbnail_span);
                         Some(value)
                     })
                     .collect();
@@ -251,6 +259,7 @@ impl AppState {
             stream_output: inner.stream_output.clone(),
             answer_page: inner.answer_page,
             interactive_thread_id: inner.interactive_thread_id.clone(),
+            trace_id: inner.trace_id.clone(),
             config: self.config.lock().expect("config lock").clone(),
         }
     }
@@ -651,6 +660,7 @@ fn capture_for_preset(
     state: State<'_, Arc<AppState>>,
     preset_id: String,
 ) -> Result<(), String> {
+    let trace = TraceContext::new("capture");
     state.preset(&preset_id)?;
     {
         let mut inner = state
@@ -672,13 +682,16 @@ fn capture_for_preset(
             }
         }
         inner.status = "capturing".into();
-        inner.message = Some("正在后台截取主屏".into());
+        inner.trace_id = Some(trace.trace_id.clone());
+        inner.message = Some(format!("正在后台截取主屏（traceId: {}）", trace.trace_id));
     }
     emit_snapshot(&app, &state);
     let work_dir = state.work_dir.clone();
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let span = trace.span("capture.primary_screen");
         let captured = capture::capture_primary(&work_dir);
+        drop(span);
         let mut inner = match state.inner.lock() {
             Ok(value) => value,
             Err(_) => return,
@@ -754,6 +767,7 @@ fn clear_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), St
 
 #[tauri::command]
 fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let trace = TraceContext::new("submit");
     let provider = state
         .config
         .lock()
@@ -761,13 +775,15 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         .provider
         .clone();
     if provider == "openai-api" {
-        let (draft, preset) = { let mut inner = state.inner.lock().map_err(|_| "application state unavailable")?; if inner.status == "solving" { return Err("已有任务正在求解".into()); } let draft = inner.draft.clone().ok_or("请先添加至少一张截图")?; let preset = state.preset(&draft.preset_id)?; inner.status = "solving".into(); inner.message = Some("正在通过 OpenAI API 求解".into()); (draft, preset) };
+        let (draft, preset) = { let mut inner = state.inner.lock().map_err(|_| "application state unavailable")?; if inner.status == "solving" { return Err("已有任务正在求解".into()); } let draft = inner.draft.clone().ok_or("请先添加至少一张截图")?; let preset = state.preset(&draft.preset_id)?; inner.status = "solving".into(); inner.trace_id = Some(trace.trace_id.clone()); inner.message = Some(format!("正在通过 OpenAI API 求解（traceId: {}）", trace.trace_id)); (draft, preset) };
         emit_snapshot(&app, &state);
         let config = state.config.lock().map_err(|_| "config state unavailable")?.clone(); let state = state.inner().clone();
         tauri::async_runtime::spawn_blocking(move || {
+            let span = trace.span("openai.chat_completions");
             let result = OpenAiProvider { base_url: config.openai_base_url, api_key: config.openai_api_key, model: config.openai_model, timeout_seconds: config.codex_timeout_seconds, prompt_addendum: config.prompt_addendum }.solve(&draft, &preset);
+            drop(span);
             let mut inner = state.inner.lock().expect("application state lock");
-            match result { Ok(answer) => { remove_draft_images(&draft); inner.answer = Some(answer); inner.draft = None; inner.status = "displaying".into(); inner.message = Some("答案已生成".into()); }, Err(error) => { remove_draft_images(&draft); inner.draft = None; inner.status = "failed".into(); inner.message = Some(format!("OpenAI 求解失败：{error}")); } }
+            match result { Ok(answer) => { remove_draft_images(&draft); inner.answer = Some(answer); inner.draft = None; inner.status = "displaying".into(); inner.message = Some(format!("答案已生成（traceId: {}）", trace.trace_id)); }, Err(error) => { trace.error(&error.to_string()); remove_draft_images(&draft); inner.draft = None; inner.status = "failed".into(); inner.message = Some(format!("OpenAI 求解失败：{error}（traceId: {}）", trace.trace_id)); } }
             drop(inner); emit_snapshot(&app, &state);
         });
         return Ok(());
@@ -787,7 +803,8 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         let preset = state.preset(&draft.preset_id)?;
         inner.stream_output.clear();
         inner.status = "solving".into();
-        inner.message = Some("正在通过本机 Codex CLI 求解".into());
+        inner.trace_id = Some(trace.trace_id.clone());
+        inner.message = Some(format!("正在通过本机 Codex CLI 求解（traceId: {}）", trace.trace_id));
         (draft, preset)
     };
     emit_snapshot(&app, &state);
@@ -798,6 +815,7 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         .map_err(|_| "config state unavailable")?
         .clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let provider_span = trace.span("provider.solve");
         let process_state = state.clone();
         let pid_state = process_state.clone();
         let progress_state = process_state.clone();
@@ -852,6 +870,7 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
                 },
             )
         };
+        drop(provider_span);
         let mut inner = state.inner.lock().expect("application state lock");
         let was_cancelled = inner.status == "cancelled" && inner.active_pid.is_none();
         if was_cancelled {
@@ -864,16 +883,20 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         match result {
             Ok(answer) => {
                 let answer_preset_id = draft.preset_id.clone();
+                let history_span = trace.span("history.save");
                 if let Err(error) = state.history.save(&draft, &answer) {
                     inner.message = Some(format!("答案已生成，但加密历史保存失败：{error}"));
                 }
+                drop(history_span);
+                let cleanup_span = trace.span("draft.cleanup");
                 remove_draft_images(&draft);
+                drop(cleanup_span);
                 inner.answer = Some(answer);
                 inner.answer_page = 0;
                 inner.answer_preset_id = Some(answer_preset_id);
                 inner.draft = None;
                 inner.status = "displaying".into();
-                inner.message = Some("答案已生成".into());
+                inner.message = Some(format!("答案已生成（traceId: {}）", trace.trace_id));
                 if inner.protected_overlay && !inner.overlay_user_hidden {
                     if let Some(overlay_window) = app.get_webview_window("overlay") {
                         let _ = overlay::show(&overlay_window);
@@ -883,10 +906,13 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
                 }
             }
             Err(error) => {
+                trace.error(&error.to_string());
+                let cleanup_span = trace.span("draft.cleanup");
                 remove_draft_images(&draft);
+                drop(cleanup_span);
                 inner.draft = None;
                 inner.status = "failed".into();
-                inner.message = Some(format!("求解失败：{error}"));
+                inner.message = Some(format!("求解失败：{error}（traceId: {}）", trace.trace_id));
             }
         }
         inner.active_pid = None;
