@@ -60,6 +60,12 @@ body { color: var(--bb-text); background: radial-gradient(circle at 18% -8%, rgb
 .mobile-preset .arco-select-view-value { color: var(--bb-text) !important; }
 .mobile-preset .arco-select-view-placeholder { color: var(--bb-muted) !important; }
 .mobile-preset .arco-select-view:focus-within { border-color: var(--bb-primary) !important; box-shadow: 0 0 0 2px var(--bb-focus) !important; }
+.mobile-settings-card .arco-card-body { display: flex; flex-direction: column; gap: 13px; }
+.mobile-setting-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.mobile-setting-line > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.mobile-setting-line .arco-typography { color: var(--bb-text) !important; font-size: 14px; font-weight: 650; }
+.mobile-setting-line .arco-typography-secondary { color: var(--bb-muted) !important; font-size: 12px; font-weight: 400; line-height: 1.35; }
+.mobile-setting-line .arco-switch { flex: 0 0 auto; }
 .arco-select-popup, .arco-trigger-popup { border: 1px solid var(--bb-border-strong) !important; border-radius: 10px !important; background: var(--bb-panel) !important; box-shadow: 0 14px 32px rgba(3, 8, 20, .30) !important; }
 .arco-select-popup .arco-select-popup-inner { background: var(--bb-panel) !important; scrollbar-width: none; }
 .arco-select-popup .arco-select-popup-inner::-webkit-scrollbar { width: 0; height: 0; }

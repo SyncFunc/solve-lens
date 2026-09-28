@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Alert, Button, Card, ConfigProvider, Select, Space, Tag, Typography } from "@arco-design/web-react";
+import { Alert, Button, Card, ConfigProvider, Select, Space, Switch, Tag, Typography } from "@arco-design/web-react";
 import { IconCheckCircle, IconClose, IconLoading, IconPlayArrow, IconUpload } from "@arco-design/web-react/icon";
 import { gcm } from "@noble/ciphers/aes.js";
 import { p256 } from "@noble/curves/nist.js";
@@ -10,8 +10,9 @@ import "./mobile_ui.css";
 import type { Snapshot } from "./ui_types";
 
 const { Title, Text, Paragraph } = Typography;
-type MobileState = Pick<Snapshot, "status" | "message" | "answer" | "draft" | "config" | "interactive_thread_id"> & { presets?: Snapshot["presets"] };
+type MobileState = Pick<Snapshot, "status" | "message" | "answer" | "draft" | "config" | "interactive_thread_id" | "has_openai_history" | "openai_history_turn_count"> & { presets?: Snapshot["presets"] };
 type Pending = { id: string; kind: "capture" | "submit" | "clear" | "cancel"; before: number };
+type MobileSettingsPatch = Partial<Pick<Snapshot["config"], "auto_submit_after_capture" | "conversation_mode">>;
 type CryptoKeyMaterial = CryptoKey | Uint8Array;
 type CryptoSession = { id: string; key: CryptoKeyMaterial; native: boolean };
 type CryptoEnvelope = { encrypted?: boolean; iv?: string; data?: string };
@@ -101,6 +102,7 @@ function MobileApp() {
   const [connection, setConnection] = useState<"connecting" | "connected" | "reconnecting" | "failed">("connecting");
   const [toast, setToast] = useState<{ level: "info" | "success" | "error"; text: string } | undefined>(undefined);
   const [pending, setPending] = useState<Pending | undefined>(undefined);
+  const [settingsUpdating, setSettingsUpdating] = useState(false);
   const [preset, setPreset] = useState("general");
   const wsRef = useRef<WebSocket | undefined>(undefined);
   const cryptoRef = useRef<CryptoSession | undefined>(undefined);
@@ -189,6 +191,33 @@ function MobileApp() {
     pendingPollTimer.current = window.setInterval(() => { void poll(); }, 800);
     return () => { if (pendingPollTimer.current) clearInterval(pendingPollTimer.current); };
   }, [pending?.id, poll]);
+  const updateAnswerSettings = async (patch: MobileSettingsPatch) => {
+    if (!state || settingsUpdating) return;
+    const before = state.config;
+    setSettingsUpdating(true);
+    setState(current => current ? { ...current, config: { ...current.config, ...patch } } : current);
+    try {
+      const session = await ensureCryptoSession();
+      const payload = await encryptPayload(session, patch);
+      const response = await fetch("/api/config", {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json", "X-Baobao-Session": session.id },
+        body: payload,
+      });
+      const result = await decryptPayload<{ accepted?: boolean; error?: string }>(session, response);
+      if (!response.ok || result.accepted !== true) {
+        throw new Error(result.error || `配置保存失败（HTTP ${response.status}）`);
+      }
+      notify("success", "答题设置已保存");
+      void poll();
+    } catch (error) {
+      setState(current => current ? { ...current, config: before } : current);
+      notify("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setSettingsUpdating(false);
+    }
+  };
   const command = async (kind: Pending["kind"], action: string, preset?: string) => {
     const id = String(Date.now()) + "-" + Math.random().toString(16).slice(2);
     if (pendingTimer.current) clearTimeout(pendingTimer.current);
@@ -211,8 +240,50 @@ function MobileApp() {
       setPending(undefined);
       notify("error", error instanceof DOMException && error.name === "AbortError" ? "桌面端请求超时，请检查局域网连接" : String(error));
     }
-  };  const imageCount = state?.draft?.image_count ?? 0; const interactiveThread = state?.interactive_thread_id; const presetName = state?.presets?.find(item => item.id === preset)?.name ?? (preset === "math" ? "数学" : preset === "code" ? "代码" : "通用");
-  return <div className="mobile-shell"><header className="mobile-header"><div><Title heading={3}>宝宝巴士</Title><Text type="secondary">手机控制台</Text></div><Tag color={connection === "connected" ? "green" : connection === "reconnecting" ? "orange" : "gray"}>{connection === "connected" ? "已连接 · 加密" : connection === "reconnecting" ? "正在重连" : "连接中"}</Tag></header><main className="mobile-main"><Card className="mobile-status" bordered={false}><Space direction="vertical"><div className="status-line"><Text type="secondary">任务状态</Text><Tag color={state?.status === "idle" ? "gray" : "arcoblue"}>{state?.status ?? "加载中"}</Tag></div><Text type="secondary">草稿图片：{imageCount} 张</Text>{state?.message && <Alert type="info" content={state.message} showIcon />}</Space></Card><Card className="mobile-card mobile-preset-card" bordered={false}><div className="mobile-preset"><Text type="secondary">截图题型</Text><Select value={preset} onChange={setPreset} size="large"><Select.Option value="general">通用</Select.Option><Select.Option value="math">数学</Select.Option><Select.Option value="code">代码</Select.Option></Select></div></Card><div className="mobile-actions"><Button type="primary" className="mobile-action" size="large" loading={pending?.kind === "capture"} disabled={Boolean(pending)} icon={<IconUpload />} onClick={() => void command("capture", "capture", preset)}>截图加入草稿（{presetName}）</Button><Button type="primary" className="mobile-action" size="large" loading={pending?.kind === "submit"} disabled={Boolean(pending) || !imageCount} icon={<IconPlayArrow />} onClick={() => void command("submit", "submit")}>提交题目</Button><Button type="secondary" className="mobile-action" size="large" loading={pending?.kind === "clear"} disabled={Boolean(pending) || !imageCount} onClick={() => void command("clear", "clear")}>清空草稿</Button><Button type="secondary" className="mobile-action" size="large" loading={pending?.kind === "cancel"} disabled={Boolean(pending)} onClick={() => void command("cancel", "cancel")}>取消任务</Button></div>{state?.draft?.thumbnails?.length ? <Card title="截图预览" className="mobile-card"><div className="mobile-thumbs">{state.draft.thumbnails.map((src, i) => <img key={i} src={src} alt={`第 ${i + 1} 张`} />)}</div></Card> : null}{state?.answer?.text ? <Card title="答题结果" className="mobile-card"><Paragraph className="mobile-answer">{state.answer.text}</Paragraph></Card> : <Card className="mobile-card empty-answer"><Text type="secondary">完成提交后，答案会显示在这里</Text></Card>}</main>{toast && <div className={`mobile-toast toast-${toast.level}`}><span>{toastIcon(toast.level)}</span>{toast.text}</div>}</div>;
+  };
+  const imageCount = state?.draft?.image_count ?? 0;
+  const interactiveThread = state?.interactive_thread_id;
+  const busy = Boolean(pending) || state?.status === "capturing" || state?.status === "solving";
+  const autoSubmit = state?.config.auto_submit_after_capture ?? false;
+  const continuous = state?.config.conversation_mode === "continuous";
+  const presetName = state?.presets?.find(item => item.id === preset)?.name
+    ?? (preset === "math" ? "数学" : preset === "code" ? "代码" : "通用");
+  const conversationHint = state?.config.provider === "openai-api"
+    ? "OpenAI API 连续模式会在本机维护本次运行的聊天记录。"
+    : "Codex 连续模式会复用同一个会话。";
+
+  return <div className="mobile-shell">
+    <header className="mobile-header">
+      <div><Title heading={3}>宝宝巴士</Title><Text type="secondary">手机控制台</Text></div>
+      <Tag color={connection === "connected" ? "green" : connection === "reconnecting" ? "orange" : "gray"}>{connection === "connected" ? "已连接 · 加密" : connection === "reconnecting" ? "正在重连" : "连接中"}</Tag>
+    </header>
+    <main className="mobile-main">
+      <Card className="mobile-status" bordered={false}>
+        <Space direction="vertical">
+          <div className="status-line"><Text type="secondary">任务状态</Text><Tag color={state?.status === "idle" ? "gray" : "arcoblue"}>{state?.status ?? "加载中"}</Tag></div>
+          <Text type="secondary">草稿图片：{imageCount} 张</Text>
+          {state?.config.provider === "openai-api" && continuous && <Text type="secondary">连续上下文：已累计 {state.openai_history_turn_count} 轮</Text>}
+          {state?.message && <Alert type="info" content={state.message} showIcon />}
+        </Space>
+      </Card>
+      <Card className="mobile-card mobile-preset-card" bordered={false}>
+        <div className="mobile-preset"><Text type="secondary">截图题型</Text><Select value={preset} onChange={setPreset} size="large"><Select.Option value="general">通用</Select.Option><Select.Option value="math">数学</Select.Option><Select.Option value="code">代码</Select.Option></Select></div>
+      </Card>
+      <Card className="mobile-card mobile-settings-card" bordered={false}>
+        <div className="mobile-setting-line"><div><Text>截图后直接提交</Text><Text type="secondary">截图完成后立即开始解题</Text></div><Switch checked={autoSubmit} disabled={!state || busy || settingsUpdating} onChange={value => void updateAnswerSettings({ auto_submit_after_capture: value })} /></div>
+        <div className="mobile-setting-line"><div><Text>连续对话</Text><Text type="secondary">{continuous ? conversationHint : "单轮模式不会保留上次解题上下文。"}</Text></div><Switch checked={continuous} disabled={!state || busy || settingsUpdating} onChange={value => void updateAnswerSettings({ conversation_mode: value ? "continuous" : "single" })} /></div>
+      </Card>
+      <div className="mobile-actions">
+        <Button type="primary" className="mobile-action" size="large" loading={pending?.kind === "capture"} disabled={busy} icon={<IconUpload />} onClick={() => void command("capture", "capture", preset)}>{autoSubmit ? `截图并提交（${presetName}）` : `截图加入草稿（${presetName}）`}</Button>
+        <Button type="primary" className="mobile-action" size="large" loading={pending?.kind === "submit"} disabled={busy || !imageCount} icon={<IconPlayArrow />} onClick={() => void command("submit", "submit")}>提交题目</Button>
+        <Button type="secondary" className="mobile-action" size="large" loading={pending?.kind === "clear"} disabled={busy || (!imageCount && !interactiveThread && !state?.has_openai_history)} onClick={() => void command("clear", "clear")}>清空草稿</Button>
+        <Button type="secondary" className="mobile-action" size="large" loading={pending?.kind === "cancel"} disabled={Boolean(pending) || !busy} onClick={() => void command("cancel", "cancel")}>取消任务</Button>
+      </div>
+      {state?.draft?.thumbnails?.length ? <Card title="截图预览" className="mobile-card"><div className="mobile-thumbs">{state.draft.thumbnails.map((src, i) => <img key={i} src={src} alt={`第 ${i + 1} 张`} />)}</div></Card> : null}
+      {state?.answer?.text ? <Card title="答题结果" className="mobile-card"><Paragraph className="mobile-answer">{state.answer.text}</Paragraph></Card> : <Card className="mobile-card empty-answer"><Text type="secondary">完成提交后，答案会显示在这里</Text></Card>}
+    </main>
+    {toast && <div className={`mobile-toast toast-${toast.level}`}><span>{toastIcon(toast.level)}</span>{toast.text}</div>}
+  </div>;
 }
 
 const root = document.getElementById("mobile-app");

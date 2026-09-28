@@ -40,6 +40,8 @@ export type Config = {
   provider: string;
   codex_path: string;
   codex_execution_mode: "exec" | "interactive";
+  auto_submit_after_capture: boolean;
+  conversation_mode: "single" | "continuous";
   openai_base_url: string;
   openai_api_key: string;
   openai_model: string;
@@ -72,6 +74,8 @@ export type Snapshot = {
   answer?: { text: string };
   answer_page: number;
   interactive_thread_id?: string;
+  has_openai_history: boolean;
+  openai_history_turn_count: number;
 
   presets: Preset[];
   status: string;

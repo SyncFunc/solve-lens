@@ -9,18 +9,21 @@ mod control;
 mod domain;
 mod history;
 mod local_server;
-mod overlay;
 mod openai;
-mod trace;
+mod overlay;
 mod presets;
+mod trace;
 
 use crate::{
-    codex::{CodexCliProvider, CodexModelOption, CodexThreadOption, InteractiveCodexProvider, InteractiveTurnControl},
-    openai::OpenAiProvider,
-    trace::TraceContext,
+    codex::{
+        CodexCliProvider, CodexModelOption, CodexThreadOption, InteractiveCodexProvider,
+        InteractiveTurnControl,
+    },
     domain::{AnswerResult, DraftView, PromptPreset, QuestionDraft},
     history::HistoryStore,
+    openai::{append_history, OpenAiProvider},
     presets::built_in_presets,
+    trace::TraceContext,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
@@ -56,6 +59,9 @@ struct Inner {
     active_interactive_turn: Option<Arc<InteractiveTurnControl>>,
     interactive_thread_id: Option<String>,
     interactive_thread_user_selected: bool,
+    /// OpenAI Chat Completions has no remote thread. In continuous mode this
+    /// holds the request/response messages that must be resent on each turn.
+    openai_history: Vec<serde_json::Value>,
     trace_id: Option<String>,
     stream_output: String,
     answer_page: usize,
@@ -113,6 +119,8 @@ struct AppConfig {
     provider: String,
     codex_path: String,
     codex_execution_mode: String,
+    auto_submit_after_capture: bool,
+    conversation_mode: String,
     openai_base_url: String,
     openai_api_key: String,
     openai_model: String,
@@ -140,6 +148,8 @@ impl Default for AppConfig {
             provider: "codex-cli".into(),
             codex_path: String::new(),
             codex_execution_mode: "exec".into(),
+            auto_submit_after_capture: false,
+            conversation_mode: "single".into(),
             openai_base_url: "https://api.openai.com".into(),
             openai_api_key: String::new(),
             openai_model: "gpt-4o-mini".into(),
@@ -187,6 +197,8 @@ struct Snapshot {
     stream_output: String,
     answer_page: usize,
     interactive_thread_id: Option<String>,
+    has_openai_history: bool,
+    openai_history_turn_count: usize,
     trace_id: Option<String>,
     config: AppConfig,
 }
@@ -224,7 +236,11 @@ impl AppState {
                                 return Some(value.clone());
                             }
                         }
-                        let thumbnail_trace = TraceContext { trace_id: snapshot_trace_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()) };
+                        let thumbnail_trace = TraceContext {
+                            trace_id: snapshot_trace_id
+                                .clone()
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        };
                         let thumbnail_span = thumbnail_trace.span("thumbnail.generate");
                         let bytes = fs::read(&image.path).ok()?;
                         let value = if full_images {
@@ -259,6 +275,8 @@ impl AppState {
             stream_output: inner.stream_output.clone(),
             answer_page: inner.answer_page,
             interactive_thread_id: inner.interactive_thread_id.clone(),
+            has_openai_history: !inner.openai_history.is_empty(),
+            openai_history_turn_count: inner.openai_history.len() / 2,
             trace_id: inner.trace_id.clone(),
             config: self.config.lock().expect("config lock").clone(),
         }
@@ -288,21 +306,54 @@ impl AppState {
 }
 
 #[derive(Serialize, Deserialize, Default)]
-struct StoredInteractiveSession { thread_id: Option<String> }
+struct StoredInteractiveSession {
+    thread_id: Option<String>,
+}
 
 fn load_interactive_thread(path: &PathBuf) -> Option<String> {
-    fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<StoredInteractiveSession>(&bytes).ok()).and_then(|value| value.thread_id)
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StoredInteractiveSession>(&bytes).ok())
+        .and_then(|value| value.thread_id)
 }
 
 fn persist_interactive_thread(state: &AppState, thread_id: Option<String>) -> Result<(), String> {
-    fs::write(&state.interactive_session_path, serde_json::to_vec_pretty(&StoredInteractiveSession { thread_id }).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
+    fs::write(
+        &state.interactive_session_path,
+        serde_json::to_vec_pretty(&StoredInteractiveSession { thread_id })
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn load_config(path: &PathBuf) -> AppConfig {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    let Ok(bytes) = fs::read(path) else {
+        return AppConfig::default();
+    };
+    let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return AppConfig::default(),
+    };
+    // Migrate the old Codex-only selector to the provider-neutral switch.
+    // Existing interactive users keep their current behaviour after upgrade.
+    if value.get("conversation_mode").is_none() {
+        let mode = if value
+            .get("codex_execution_mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("interactive")
+        {
+            "continuous"
+        } else {
+            "single"
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "conversation_mode".into(),
+                serde_json::Value::String(mode.into()),
+            );
+        }
+    }
+    serde_json::from_value(value).unwrap_or_default()
 }
 
 fn persist_config(state: &AppState) -> Result<(), String> {
@@ -331,15 +382,16 @@ fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
         (base, patch) => *base = patch.clone(),
     }
 }
-#[tauri::command]
-fn update_config(
+fn update_config_impl(
     app: AppHandle,
-    state: State<'_, Arc<AppState>>,
+    state: &Arc<AppState>,
     config: serde_json::Value,
 ) -> Result<(), String> {
     if !config.is_object() {
         return Err("配置 patch 必须是 JSON 对象".into());
     }
+    let requested_conversation_mode = config.get("conversation_mode").is_some();
+    let requested_legacy_execution_mode = config.get("codex_execution_mode").is_some();
     let mut merged = serde_json::to_value(
         state
             .config
@@ -349,19 +401,39 @@ fn update_config(
     )
     .map_err(|error| error.to_string())?;
     merge_json(&mut merged, &config);
-    let config: AppConfig =
+    let mut config: AppConfig =
         serde_json::from_value(merged).map_err(|error| format!("配置格式无效：{error}"))?;
+    // Keep the former Codex-only field as a persisted compatibility alias.
+    // New callers use the provider-neutral conversation switch instead.
+    if !requested_conversation_mode && requested_legacy_execution_mode {
+        config.conversation_mode = if config.codex_execution_mode == "interactive" {
+            "continuous".into()
+        } else {
+            "single".into()
+        };
+    }
     let previous_config = state
         .config
         .lock()
         .map_err(|_| "config state unavailable")?
         .clone();
-    if !matches!(config.provider.as_str(), "codex-cli" | "claude-code-cli" | "openai-api") {
+    if !matches!(
+        config.provider.as_str(),
+        "codex-cli" | "claude-code-cli" | "openai-api"
+    ) {
         return Err("未知 Provider，请选择 Codex CLI、OpenAI API 或 Claude Code CLI".into());
     }
     if !matches!(config.codex_execution_mode.as_str(), "exec" | "interactive") {
         return Err("Codex 执行模式必须是 exec 或 interactive".into());
     }
+    if !matches!(config.conversation_mode.as_str(), "single" | "continuous") {
+        return Err("对话模式必须是 single（单轮）或 continuous（连续）".into());
+    }
+    config.codex_execution_mode = if config.conversation_mode == "continuous" {
+        "interactive".into()
+    } else {
+        "exec".into()
+    };
     if !config.overlay_opacity.is_finite() || !(0.05..=0.95).contains(&config.overlay_opacity) {
         return Err("前台背景不透明度必须在 0.05 到 0.95 之间".into());
     }
@@ -441,7 +513,7 @@ fn update_config(
                 server.stop();
             }
         }
-        let app_state = state.inner().clone();
+        let app_state = state.clone();
         let mut server_slot = state
             .local_server
             .lock()
@@ -475,10 +547,19 @@ fn update_config(
                 .map_err(|error| error.to_string())?;
         }
     }
+    let reset_openai_history = (previous_config.provider == "openai-api"
+        || config.provider == "openai-api")
+        && (previous_config.provider != config.provider
+            || previous_config.conversation_mode != config.conversation_mode
+            || previous_config.openai_base_url != config.openai_base_url
+            || previous_config.openai_model != config.openai_model);
     let mut inner = state
         .inner
         .lock()
         .map_err(|_| "application state unavailable")?;
+    if reset_openai_history {
+        inner.openai_history.clear();
+    }
     inner.message = Some("配置已保存；变更的快捷键已立即应用。".into());
     drop(inner);
     emit_snapshot(&app, &state);
@@ -589,24 +670,84 @@ fn list_codex_models(state: State<'_, Arc<AppState>>) -> Result<Vec<CodexModelOp
 }
 
 #[tauri::command]
-fn list_codex_threads(state: State<'_, Arc<AppState>>, include_archived: Option<bool>) -> Result<Vec<CodexThreadOption>, String> {
-    let config = state.config.lock().map_err(|_| "config state unavailable")?.clone();
-    if config.provider != "codex-cli" { return Err("当前 Provider 不是 Codex CLI".into()); }
-    InteractiveCodexProvider::new(state.work_dir.clone(), config.codex_path, config.codex_model, config.codex_reasoning_effort, config.codex_service_tier, config.codex_timeout_seconds, config.prompt_addendum)
-        .list_threads(include_archived.unwrap_or(false)).map_err(|error| error.to_string())
+fn list_codex_threads(
+    state: State<'_, Arc<AppState>>,
+    include_archived: Option<bool>,
+) -> Result<Vec<CodexThreadOption>, String> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| "config state unavailable")?
+        .clone();
+    if config.provider != "codex-cli" {
+        return Err("当前 Provider 不是 Codex CLI".into());
+    }
+    InteractiveCodexProvider::new(
+        state.work_dir.clone(),
+        config.codex_path,
+        config.codex_model,
+        config.codex_reasoning_effort,
+        config.codex_service_tier,
+        config.codex_timeout_seconds,
+        config.prompt_addendum,
+    )
+    .list_threads(include_archived.unwrap_or(false))
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn select_codex_thread(app: AppHandle, state: State<'_, Arc<AppState>>, thread_id: String) -> Result<(), String> {
-    if thread_id.trim().is_empty() { return Err("threadId 不能为空".into()); }
-    let mut inner = state.inner.lock().map_err(|_| "application state unavailable")?;
-    if inner.status == "solving" { return Err("任务进行中，不能切换会话".into()); }
+fn select_codex_thread(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    thread_id: String,
+) -> Result<(), String> {
+    if thread_id.trim().is_empty() {
+        return Err("threadId 不能为空".into());
+    }
+    let mut inner = state
+        .inner
+        .lock()
+        .map_err(|_| "application state unavailable")?;
+    if inner.status == "solving" {
+        return Err("任务进行中，不能切换会话".into());
+    }
     inner.interactive_thread_id = (thread_id != "new").then(|| thread_id.trim().to_owned());
     inner.interactive_thread_user_selected = thread_id != "new";
     persist_interactive_thread(&state, inner.interactive_thread_id.clone())?;
     drop(inner);
     emit_snapshot(&app, &state);
     Ok(())
+}
+
+#[tauri::command]
+fn update_config(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    config: serde_json::Value,
+) -> Result<(), String> {
+    update_config_impl(app, state.inner(), config)
+}
+
+/// The LAN page may change only the two non-sensitive answer-behaviour
+/// switches. Provider credentials and the rest of the desktop configuration
+/// remain unavailable over the local HTTP surface.
+pub(crate) fn update_remote_answer_settings(
+    app: AppHandle,
+    config: serde_json::Value,
+) -> Result<(), String> {
+    let object = config
+        .as_object()
+        .ok_or("远程配置 patch 必须是 JSON 对象")?;
+    if object.is_empty()
+        || object
+            .keys()
+            .any(|key| key != "auto_submit_after_capture" && key != "conversation_mode")
+    {
+        return Err("远程页面只能更新自动提交和对话模式".into());
+    }
+    let state_owner = app.clone();
+    let state = state_owner.state::<Arc<AppState>>();
+    update_config_impl(app, state.inner(), config)
 }
 
 pub(crate) fn dispatch_remote_command(
@@ -662,6 +803,11 @@ fn capture_for_preset(
 ) -> Result<(), String> {
     let trace = TraceContext::new("capture");
     state.preset(&preset_id)?;
+    let auto_submit_after_capture = state
+        .config
+        .lock()
+        .map_err(|_| "config state unavailable")?
+        .auto_submit_after_capture;
     {
         let mut inner = state
             .inner
@@ -688,10 +834,12 @@ fn capture_for_preset(
     emit_snapshot(&app, &state);
     let work_dir = state.work_dir.clone();
     let state = state.inner().clone();
+    let submit_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let span = trace.span("capture.primary_screen");
         let captured = capture::capture_primary(&work_dir);
         drop(span);
+        let mut should_submit = false;
         let mut inner = match state.inner.lock() {
             Ok(value) => value,
             Err(_) => return,
@@ -717,7 +865,12 @@ fn capture_for_preset(
                     inner.stream_output.clear();
                     inner.answer_page = 0;
                     inner.status = "drafting".into();
-                    inner.message = Some("截图已添加到草稿".into());
+                    should_submit = auto_submit_after_capture;
+                    inner.message = Some(if auto_submit_after_capture {
+                        "截图已添加，正在自动提交".into()
+                    } else {
+                        "截图已添加到草稿".into()
+                    });
                 }
             }
             Err(error) => {
@@ -727,22 +880,53 @@ fn capture_for_preset(
         }
         drop(inner);
         emit_snapshot(&app, &state);
+        if should_submit {
+            let submit_state = submit_app.state::<Arc<AppState>>();
+            if let Err(error) = submit_draft(submit_app.clone(), submit_state) {
+                if let Ok(mut inner) = state.inner.lock() {
+                    inner.status = "drafting".into();
+                    inner.message = Some(format!("截图成功，但自动提交失败：{error}"));
+                }
+                emit_snapshot(&submit_app, &state);
+            }
+        }
     });
     Ok(())
 }
 #[tauri::command]
 fn clear_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let (thread_id, config) = {
-        let inner = state.inner.lock().map_err(|_| "application state unavailable")?;
-        (inner.interactive_thread_id.clone(), state.config.lock().map_err(|_| "config state unavailable")?.clone())
+        let inner = state
+            .inner
+            .lock()
+            .map_err(|_| "application state unavailable")?;
+        (
+            inner.interactive_thread_id.clone(),
+            state
+                .config
+                .lock()
+                .map_err(|_| "config state unavailable")?
+                .clone(),
+        )
     };
     // OpenAI API is stateless per request. A previously selected Codex
     // interactive thread must never be archived while another Provider is
     // active (especially after switching to OpenAI API mode).
-    if config.provider == "codex-cli" && config.codex_execution_mode == "interactive" {
+    let clear_interactive_session =
+        config.provider == "codex-cli" && config.conversation_mode == "continuous";
+    if clear_interactive_session {
         if let Some(thread_id) = thread_id {
-        InteractiveCodexProvider::new(state.work_dir.clone(), config.codex_path, config.codex_model, config.codex_reasoning_effort, config.codex_service_tier, config.codex_timeout_seconds, config.prompt_addendum)
-            .archive(&thread_id).map_err(|error| format!("无法归档交互会话，草稿未清空：{error}"))?;
+            InteractiveCodexProvider::new(
+                state.work_dir.clone(),
+                config.codex_path,
+                config.codex_model,
+                config.codex_reasoning_effort,
+                config.codex_service_tier,
+                config.codex_timeout_seconds,
+                config.prompt_addendum,
+            )
+            .archive(&thread_id)
+            .map_err(|error| format!("无法归档交互会话，草稿未清空：{error}"))?;
         }
     }
     let mut inner = state
@@ -756,11 +940,21 @@ fn clear_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), St
     inner.answer_preset_id = None;
     inner.stream_output.clear();
     inner.answer_page = 0;
-    inner.interactive_thread_id = None;
+    let cleared_openai_history = !inner.openai_history.is_empty();
+    inner.openai_history.clear();
+    if clear_interactive_session {
+        inner.interactive_thread_id = None;
+    }
     inner.status = "idle".into();
-    inner.message = Some("草稿已清空".into());
+    inner.message = Some(if cleared_openai_history {
+        "草稿和连续对话已清空".into()
+    } else {
+        "草稿已清空".into()
+    });
     drop(inner);
-    persist_interactive_thread(&state, None)?;
+    if clear_interactive_session {
+        persist_interactive_thread(&state, None)?;
+    }
     emit_snapshot(&app, &state);
     Ok(())
 }
@@ -775,16 +969,81 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         .provider
         .clone();
     if provider == "openai-api" {
-        let (draft, preset) = { let mut inner = state.inner.lock().map_err(|_| "application state unavailable")?; if inner.status == "solving" { return Err("已有任务正在求解".into()); } let draft = inner.draft.clone().ok_or("请先添加至少一张截图")?; let preset = state.preset(&draft.preset_id)?; inner.status = "solving".into(); inner.trace_id = Some(trace.trace_id.clone()); inner.message = Some(format!("正在通过 OpenAI API 求解（traceId: {}）", trace.trace_id)); (draft, preset) };
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| "config state unavailable")?
+            .clone();
+        let (draft, preset, history) = {
+            let mut inner = state
+                .inner
+                .lock()
+                .map_err(|_| "application state unavailable")?;
+            if inner.status == "solving" {
+                return Err("已有任务正在求解".into());
+            }
+            let draft = inner.draft.clone().ok_or("请先添加至少一张截图")?;
+            let preset = state.preset(&draft.preset_id)?;
+            let history = if config.conversation_mode == "continuous" {
+                inner.openai_history.clone()
+            } else {
+                Vec::new()
+            };
+            inner.status = "solving".into();
+            inner.trace_id = Some(trace.trace_id.clone());
+            inner.message = Some(if config.conversation_mode == "continuous" {
+                format!(
+                    "正在通过 OpenAI API 连续模式求解（已带入 {} 轮上下文，traceId: {}）",
+                    history.len() / 2,
+                    trace.trace_id
+                )
+            } else {
+                format!("正在通过 OpenAI API 单轮模式求解（traceId: {}）", trace.trace_id)
+            });
+            (draft, preset, history)
+        };
         emit_snapshot(&app, &state);
-        let config = state.config.lock().map_err(|_| "config state unavailable")?.clone(); let state = state.inner().clone();
+        let state = state.inner().clone();
         tauri::async_runtime::spawn_blocking(move || {
             let span = trace.span("openai.chat_completions");
-            let result = OpenAiProvider { base_url: config.openai_base_url, api_key: config.openai_api_key, model: config.openai_model, timeout_seconds: config.codex_timeout_seconds, prompt_addendum: config.prompt_addendum }.solve(&draft, &preset);
+            let result = OpenAiProvider {
+                base_url: config.openai_base_url,
+                api_key: config.openai_api_key,
+                model: config.openai_model,
+                timeout_seconds: config.codex_timeout_seconds,
+                prompt_addendum: config.prompt_addendum,
+            }
+            .solve(&draft, &preset, &history);
             drop(span);
             let mut inner = state.inner.lock().expect("application state lock");
-            match result { Ok(answer) => { remove_draft_images(&draft); inner.answer = Some(answer); inner.draft = None; inner.status = "displaying".into(); inner.message = Some(format!("答案已生成（traceId: {}）", trace.trace_id)); }, Err(error) => { trace.error(&error.to_string()); remove_draft_images(&draft); inner.draft = None; inner.status = "failed".into(); inner.message = Some(format!("OpenAI 求解失败：{error}（traceId: {}）", trace.trace_id)); } }
-            drop(inner); emit_snapshot(&app, &state);
+            match result {
+                Ok(result) => {
+                    if config.conversation_mode == "continuous" {
+                        append_history(
+                            &mut inner.openai_history,
+                            result.user_message,
+                            &result.answer,
+                        );
+                    }
+                    remove_draft_images(&draft);
+                    inner.answer = Some(result.answer);
+                    inner.draft = None;
+                    inner.status = "displaying".into();
+                    inner.message = Some(format!("答案已生成（traceId: {}）", trace.trace_id));
+                }
+                Err(error) => {
+                    trace.error(&error.to_string());
+                    remove_draft_images(&draft);
+                    inner.draft = None;
+                    inner.status = "failed".into();
+                    inner.message = Some(format!(
+                        "OpenAI 求解失败：{error}（traceId: {}）",
+                        trace.trace_id
+                    ));
+                }
+            }
+            drop(inner);
+            emit_snapshot(&app, &state);
         });
         return Ok(());
     }
@@ -804,7 +1063,10 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         inner.stream_output.clear();
         inner.status = "solving".into();
         inner.trace_id = Some(trace.trace_id.clone());
-        inner.message = Some(format!("正在通过本机 Codex CLI 求解（traceId: {}）", trace.trace_id));
+        inner.message = Some(format!(
+            "正在通过本机 Codex CLI 求解（traceId: {}）",
+            trace.trace_id
+        ));
         (draft, preset)
     };
     emit_snapshot(&app, &state);
@@ -821,52 +1083,117 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
         let progress_state = process_state.clone();
 
         let result = if config.codex_execution_mode == "interactive" {
-            let (existing_thread, strict_resume) = { let inner = state.inner.lock().expect("application state lock"); (inner.interactive_thread_id.clone(), inner.interactive_thread_user_selected) };
+            let (existing_thread, strict_resume) = {
+                let inner = state.inner.lock().expect("application state lock");
+                (
+                    inner.interactive_thread_id.clone(),
+                    inner.interactive_thread_user_selected,
+                )
+            };
             let thread_state = state.clone();
             let control_state = state.clone();
             let fallback_pid_state = state.clone();
             let fallback_progress_state = state.clone();
             InteractiveCodexProvider::new(
-                state.work_dir.clone(), config.codex_path.clone(), config.codex_model.clone(),
-                config.codex_reasoning_effort.clone(), config.codex_service_tier.clone(),
-                config.codex_timeout_seconds, config.prompt_addendum.clone(),
-            ).solve(
-                existing_thread, strict_resume, &draft, &preset,
-                move |pid| { pid_state.inner.lock().expect("application state lock").active_pid = Some(pid); },
+                state.work_dir.clone(),
+                config.codex_path.clone(),
+                config.codex_model.clone(),
+                config.codex_reasoning_effort.clone(),
+                config.codex_service_tier.clone(),
+                config.codex_timeout_seconds,
+                config.prompt_addendum.clone(),
+            )
+            .solve(
+                existing_thread,
+                strict_resume,
+                &draft,
+                &preset,
+                move |pid| {
+                    pid_state
+                        .inner
+                        .lock()
+                        .expect("application state lock")
+                        .active_pid = Some(pid);
+                },
                 move |thread_id| {
-                    thread_state.inner.lock().expect("application state lock").interactive_thread_id = Some(thread_id.clone());
+                    thread_state
+                        .inner
+                        .lock()
+                        .expect("application state lock")
+                        .interactive_thread_id = Some(thread_id.clone());
                     let _ = persist_interactive_thread(&thread_state, Some(thread_id));
                 },
-                move |control| { control_state.inner.lock().expect("application state lock").active_interactive_turn = Some(control); },
-            ).or_else(|interactive_error| {
+                move |control| {
+                    control_state
+                        .inner
+                        .lock()
+                        .expect("application state lock")
+                        .active_interactive_turn = Some(control);
+                },
+            )
+            .or_else(|interactive_error| {
                 // A broken app-server must not make the existing single-question
                 // provider unavailable. Keep the saved thread id for a later
                 // resume attempt and make the fallback visible in state.
                 if let Ok(mut inner) = state.inner.lock() {
                     inner.active_interactive_turn = None;
-                    inner.message = Some(format!("交互模式异常，已安全降级到单题模式：{interactive_error}"));
+                    inner.message = Some(format!(
+                        "交互模式异常，已安全降级到单题模式：{interactive_error}"
+                    ));
                 }
                 CodexCliProvider::new(
-                    state.work_dir.clone(), config.codex_path.clone(), config.codex_model.clone(),
-                    config.codex_reasoning_effort.clone(), config.codex_service_tier.clone(),
-                    config.codex_timeout_seconds, config.prompt_addendum.clone(),
-                ).solve(
-                    &draft, &preset,
-                    move |pid| { fallback_pid_state.inner.lock().expect("application state lock").active_pid = Some(pid); },
-                    move |_line| { if let Ok(mut inner) = fallback_progress_state.inner.lock() { if inner.status == "solving" { inner.message = Some("交互模式不可用，正在通过单题模式求解".into()); } } },
+                    state.work_dir.clone(),
+                    config.codex_path.clone(),
+                    config.codex_model.clone(),
+                    config.codex_reasoning_effort.clone(),
+                    config.codex_service_tier.clone(),
+                    config.codex_timeout_seconds,
+                    config.prompt_addendum.clone(),
+                )
+                .solve(
+                    &draft,
+                    &preset,
+                    move |pid| {
+                        fallback_pid_state
+                            .inner
+                            .lock()
+                            .expect("application state lock")
+                            .active_pid = Some(pid);
+                    },
+                    move |_line| {
+                        if let Ok(mut inner) = fallback_progress_state.inner.lock() {
+                            if inner.status == "solving" {
+                                inner.message = Some("交互模式不可用，正在通过单题模式求解".into());
+                            }
+                        }
+                    },
                 )
             })
         } else {
             CodexCliProvider::new(
-                state.work_dir.clone(), config.codex_path.clone(), config.codex_model.clone(),
-                config.codex_reasoning_effort.clone(), config.codex_service_tier.clone(),
-                config.codex_timeout_seconds, config.prompt_addendum.clone(),
-            ).solve(
-                &draft, &preset,
-                move |pid| { pid_state.inner.lock().expect("application state lock").active_pid = Some(pid); },
+                state.work_dir.clone(),
+                config.codex_path.clone(),
+                config.codex_model.clone(),
+                config.codex_reasoning_effort.clone(),
+                config.codex_service_tier.clone(),
+                config.codex_timeout_seconds,
+                config.prompt_addendum.clone(),
+            )
+            .solve(
+                &draft,
+                &preset,
+                move |pid| {
+                    pid_state
+                        .inner
+                        .lock()
+                        .expect("application state lock")
+                        .active_pid = Some(pid);
+                },
                 move |_line| {
                     let mut inner = progress_state.inner.lock().expect("application state lock");
-                    if inner.status == "solving" { inner.message = Some("正在处理 Codex 输出".into()); }
+                    if inner.status == "solving" {
+                        inner.message = Some("正在处理 Codex 输出".into());
+                    }
                 },
             )
         };
@@ -932,21 +1259,28 @@ fn cancel_current_job(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result
             .map_err(|_| "application state unavailable")?;
         inner.status = "cancelled".into();
         inner.message = Some("已取消任务".into());
-        (inner.active_pid.take(), inner.active_interactive_turn.clone())
+        (
+            inner.active_pid.take(),
+            inner.active_interactive_turn.clone(),
+        )
     };
     let is_interactive = interactive.is_some();
     if let Some(control) = interactive {
         if let Err(error) = control.interrupt() {
             // Preserve the thread even if the process is already gone; the next
             // submit will resume it or safely fall back to exec.
-            if let Ok(mut inner) = state.inner.lock() { inner.message = Some(format!("取消请求未送达 app-server：{error}")); }
+            if let Ok(mut inner) = state.inner.lock() {
+                inner.message = Some(format!("取消请求未送达 app-server：{error}"));
+            }
         }
     }
-    if !is_interactive { if let Some(pid) = pid {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-    } }
+    if !is_interactive {
+        if let Some(pid) = pid {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+    }
     emit_snapshot(&app, &state);
     Ok(())
 }
@@ -1373,8 +1707,8 @@ fn main() {
             change_answer_page,
             set_overlay_opacity,
             sample_overlay_background,
-            list_codex_models
-            ,list_codex_threads,
+            list_codex_models,
+            list_codex_threads,
             select_codex_thread
         ])
         .run(tauri::generate_context!())

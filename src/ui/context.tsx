@@ -19,6 +19,8 @@ const fallbackConfig: Config = {
   provider: "codex-cli",
   codex_path: "codex",
   codex_execution_mode: "exec",
+  auto_submit_after_capture: false,
+  conversation_mode: "single",
   openai_base_url: "https://api.openai.com",
   openai_api_key: "",
   openai_model: "gpt-4o-mini",
@@ -41,6 +43,8 @@ const fallbackConfig: Config = {
 const fallbackSnapshot: Snapshot = {
   presets: [],
   answer_page: 0,
+  has_openai_history: false,
+  openai_history_turn_count: 0,
 
   status: "idle",
   protected_overlay: false,
@@ -125,7 +129,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const baseline = snapshot.config;
     const patch: Record<string, unknown> = {};
     const scalarFields: (keyof Config)[] = [
-      "provider", "codex_path", "codex_execution_mode", "openai_base_url", "openai_api_key", "openai_model", "overlay_opacity", "overlay_theme", "overlay_font_size",
+      "provider", "codex_path", "codex_execution_mode", "auto_submit_after_capture", "conversation_mode", "openai_base_url", "openai_api_key", "openai_model", "overlay_opacity", "overlay_theme", "overlay_font_size",
       "overlay_width", "overlay_height", "codex_timeout_seconds", "codex_model", "codex_reasoning_effort", "codex_service_tier",
       "prompt_addendum", "lan_control_enabled", "lan_control_port", "mobile_auto_save_images",
     ];

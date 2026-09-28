@@ -461,7 +461,9 @@ fn handle(
             resource_root.join("dist")
         } else if resource_root.join("_up_").join("dist").is_dir() {
             resource_root.join("_up_").join("dist")
-        } else { resource_root };
+        } else {
+            resource_root
+        };
         let file = route.trim_start_matches("/assets/");
         let safe = !file.contains("..") && !file.contains('\\');
         if !safe {
@@ -502,7 +504,9 @@ fn handle(
             resource_root.join("dist")
         } else if resource_root.join("_up_").join("dist").is_dir() {
             resource_root.join("_up_").join("dist")
-        } else { resource_root };
+        } else {
+            resource_root
+        };
         let body = std::fs::read_to_string(web_root.join("mobile.html"))
             .or_else(|_| std::fs::read_to_string("../dist/mobile.html"))
             .unwrap_or_default();
@@ -584,7 +588,14 @@ fn handle(
         return Ok(());
     }
     if method == "POST"
-        && ["/api/capture", "/api/submit", "/api/clear", "/api/cancel"].contains(&route)
+        && [
+            "/api/capture",
+            "/api/submit",
+            "/api/clear",
+            "/api/cancel",
+            "/api/config",
+        ]
+        .contains(&route)
     {
         let decrypted = match decrypt_bytes(&session_key, &body) {
             Ok(value) => value,
@@ -609,6 +620,31 @@ fn handle(
                 )
             }
         };
+        if route == "/api/config" {
+            let mut patch = serde_json::Map::new();
+            for key in ["auto_submit_after_capture", "conversation_mode"] {
+                if let Some(value) = value.get(key) {
+                    patch.insert(key.to_owned(), value.clone());
+                }
+            }
+            let result =
+                crate::update_remote_answer_settings(app.clone(), serde_json::Value::Object(patch));
+            let (status, response_value) = match result {
+                Ok(()) => ("202 Accepted", json!({"accepted": true})),
+                Err(error) => (
+                    "400 Bad Request",
+                    json!({"accepted": false, "error": error}),
+                ),
+            };
+            let response = encrypt_bytes(
+                &session_key,
+                serde_json::to_string(&response_value)
+                    .unwrap_or_else(|_| "{}".into())
+                    .as_bytes(),
+            )
+            .unwrap_or_else(|_| "{}".into());
+            return write_response(stream, status, "application/json; charset=utf-8", &response);
+        }
         let command = match route {
             "/api/capture" => "capture",
             "/api/submit" => "submit",
