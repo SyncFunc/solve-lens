@@ -31,7 +31,7 @@ pub fn built_in_presets() -> Vec<PromptPreset> {
             name: "探讨题".into(),
             built_in: true,
             hotkey: String::new(),
-            task_template: "识别图片中的群面探讨论题，先判断争议的核心比较维度，再分别构建正方和反方观点。双方都要给出清晰论点、完整论述、论据或案例方向、可能反驳与回应；最后给出双方比较、适合群面发言的个人立场，以及 30 秒和 1 分钟表达版本。论据优先使用可解释的逻辑、常识性场景和可验证案例；没有可靠依据时标记为案例方向，不要编造数据、调查结果、专家观点或具体事件细节。".into(),
+            task_template: "识别图片中的探讨论题，先判断题目分别对应的正方和反方立场，再按照正方、反方、正反结合三个方向分别生成内容。每个方向都要给出可行的论点、论据或案例方向，以及约 30 秒和约 1 分钟的发言稿；不要生成其他内容。表达要直白、清楚、像正常人在群面中说话，避免拗口、过度书面、官方或文学化的表达。论据优先使用可解释的逻辑和常识性场景；没有可靠依据时标记为案例方向，不要编造数据、调查结果、专家观点或具体事件细节。".into(),
             version: 1,
         },
     ]
@@ -93,8 +93,12 @@ mod tests {
             .unwrap();
         let prompt = build_prompt(&preset, 1);
         assert!(prompt.contains("正方和反方"));
-        assert!(prompt.contains("论点、完整论述、论据或案例方向"));
+        assert!(prompt.contains("正方、反方、正反结合三个方向"));
+        assert!(prompt.contains("论点、论据或案例方向"));
+        assert!(prompt.contains("不要生成核心争议比较维度"));
+        assert!(prompt.contains("不要生成可能的反驳和回应"));
+        assert!(prompt.contains("像正常人在群面中说话"));
         assert!(prompt.contains("不要编造数据"));
-        assert!(prompt.contains("30 秒和 1 分钟表达版本"));
+        assert!(prompt.contains("约 30 秒和约 1 分钟的发言稿"));
     }
 }
