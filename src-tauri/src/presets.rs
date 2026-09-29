@@ -26,6 +26,14 @@ pub fn built_in_presets() -> Vec<PromptPreset> {
             task_template: "识别代码语言和题目要求，定位问题或给出实现方案。答案需包含可执行的关键代码与简洁说明。".into(),
             version: 1,
         },
+        PromptPreset {
+            id: "discussion".into(),
+            name: "探讨题".into(),
+            built_in: true,
+            hotkey: String::new(),
+            task_template: "识别图片中的群面探讨论题，先判断争议的核心比较维度，再分别构建正方和反方观点。双方都要给出清晰论点、完整论述、论据或案例方向、可能反驳与回应；最后给出双方比较、适合群面发言的个人立场，以及 30 秒和 1 分钟表达版本。论据优先使用可解释的逻辑、常识性场景和可验证案例；没有可靠依据时标记为案例方向，不要编造数据、调查结果、专家观点或具体事件细节。".into(),
+            version: 1,
+        },
     ]
 }
 
@@ -75,5 +83,18 @@ mod tests {
         assert!(prompt.contains("仅分析随请求提供的题图"));
         assert!(prompt.contains("数学"));
         assert!(prompt.contains("图片数量：2"));
+    }
+
+    #[test]
+    fn discussion_prompt_requires_balanced_arguments_without_fabricated_evidence() {
+        let preset = built_in_presets()
+            .into_iter()
+            .find(|item| item.id == "discussion")
+            .unwrap();
+        let prompt = build_prompt(&preset, 1);
+        assert!(prompt.contains("正方和反方"));
+        assert!(prompt.contains("论点、完整论述、论据或案例方向"));
+        assert!(prompt.contains("不要编造数据"));
+        assert!(prompt.contains("30 秒和 1 分钟表达版本"));
     }
 }
