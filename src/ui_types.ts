@@ -42,9 +42,12 @@ export type Config = {
   codex_execution_mode: "exec" | "interactive";
   auto_submit_after_capture: boolean;
   conversation_mode: "single" | "continuous";
+  simple_mode_enabled: boolean;
+  simple_mode_previous_provider: string | null;
   openai_base_url: string;
   openai_api_key: string;
   openai_model: string;
+  openai_reasoning_effort: string;
   overlay_opacity: number;
   overlay_theme: string;
   overlay_font_size: number;
@@ -70,6 +73,9 @@ export type Draft = {
 
 export type Snapshot = {
   trace_id?: string;
+  quick_overlay_symbol?: string | null;
+  quick_request_id?: string | null;
+  quick_request_status?: string | null;
   draft?: Draft;
   answer?: { text: string };
   answer_page: number;

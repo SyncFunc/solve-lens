@@ -21,7 +21,7 @@ use crate::{
     },
     domain::{AnswerResult, DraftView, PromptPreset, QuestionDraft},
     history::HistoryStore,
-    openai::{append_history, OpenAiProvider},
+    openai::{append_history, choice_dots, ChoiceToolResult, OpenAiProvider},
     presets::built_in_presets,
     trace::TraceContext,
 };
@@ -65,6 +65,10 @@ struct Inner {
     trace_id: Option<String>,
     stream_output: String,
     answer_page: usize,
+    /// Content shown by the restricted quick-mode overlay: dots, `~`, `*`, or none.
+    quick_overlay_symbol: Option<String>,
+    quick_request_id: Option<String>,
+    quick_request_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,9 +125,12 @@ struct AppConfig {
     codex_execution_mode: String,
     auto_submit_after_capture: bool,
     conversation_mode: String,
+    simple_mode_enabled: bool,
+    simple_mode_previous_provider: Option<String>,
     openai_base_url: String,
     openai_api_key: String,
     openai_model: String,
+    openai_reasoning_effort: String,
     overlay_opacity: f32,
     overlay_theme: String,
     overlay_font_size: u32,
@@ -150,9 +157,12 @@ impl Default for AppConfig {
             codex_execution_mode: "exec".into(),
             auto_submit_after_capture: false,
             conversation_mode: "single".into(),
-            openai_base_url: "https://api.openai.com".into(),
+            simple_mode_enabled: false,
+            simple_mode_previous_provider: None,
+            openai_base_url: "https://api.deepseek.com".into(),
             openai_api_key: String::new(),
-            openai_model: "gpt-4o-mini".into(),
+            openai_model: "deepseek-flash".into(),
+            openai_reasoning_effort: "low".into(),
             overlay_opacity: 0.70,
             overlay_theme: "follow".into(),
             overlay_font_size: 18,
@@ -200,6 +210,9 @@ struct Snapshot {
     has_openai_history: bool,
     openai_history_turn_count: usize,
     trace_id: Option<String>,
+    quick_overlay_symbol: Option<String>,
+    quick_request_id: Option<String>,
+    quick_request_status: Option<String>,
     config: AppConfig,
 }
 
@@ -278,8 +291,29 @@ impl AppState {
             has_openai_history: !inner.openai_history.is_empty(),
             openai_history_turn_count: inner.openai_history.len() / 2,
             trace_id: inner.trace_id.clone(),
+            quick_overlay_symbol: inner.quick_overlay_symbol.clone(),
+            quick_request_id: inner.quick_request_id.clone(),
+            quick_request_status: inner.quick_request_status.clone(),
             config: self.config.lock().expect("config lock").clone(),
         }
+    }
+
+    /// Keep the single-button phone page from receiving answers or credentials
+    /// while quick mode is active. The regular mobile control page keeps its
+    /// existing snapshot contract when quick mode is off.
+    pub(crate) fn mobile_snapshot(&self) -> serde_json::Value {
+        let inner = self.inner.lock().expect("application state lock");
+        let config = self.config.lock().expect("config lock");
+        if config.simple_mode_enabled {
+            return simple_mobile_snapshot(
+                &inner.status,
+                inner.quick_request_id.as_deref(),
+                inner.quick_request_status.as_deref(),
+            );
+        }
+        drop(config);
+        drop(inner);
+        serde_json::to_value(self.snapshot()).unwrap_or_else(|_| serde_json::json!({}))
     }
 
     fn preset(&self, id: &str) -> Result<PromptPreset, String> {
@@ -303,6 +337,19 @@ impl AppState {
         let content = serde_json::to_vec_pretty(&saved).map_err(|error| error.to_string())?;
         fs::write(&self.presets_path, content).map_err(|error| error.to_string())
     }
+}
+
+fn simple_mobile_snapshot(
+    status: &str,
+    request_id: Option<&str>,
+    request_status: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "config": { "simple_mode_enabled": true },
+        "quick_request_id": request_id,
+        "quick_request_status": request_status,
+    })
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -417,6 +464,19 @@ fn update_config_impl(
         .lock()
         .map_err(|_| "config state unavailable")?
         .clone();
+    if previous_config.simple_mode_enabled != config.simple_mode_enabled {
+        let inner = state
+            .inner
+            .lock()
+            .map_err(|_| "application state unavailable")?;
+        if matches!(
+            inner.quick_request_status.as_deref(),
+            Some("capturing" | "solving")
+        ) {
+            return Err("极简答题正在处理中，完成后再切换模式".into());
+        }
+    }
+    apply_simple_mode_config(&previous_config, &mut config)?;
     if !matches!(
         config.provider.as_str(),
         "codex-cli" | "claude-code-cli" | "openai-api"
@@ -429,6 +489,9 @@ fn update_config_impl(
     if !matches!(config.conversation_mode.as_str(), "single" | "continuous") {
         return Err("对话模式必须是 single（单轮）或 continuous（连续）".into());
     }
+    if !matches!(config.openai_reasoning_effort.as_str(), "low" | "high" | "max") {
+        return Err("OpenAI API 推理强度必须是 low、high 或 max".into());
+    }
     config.codex_execution_mode = if config.conversation_mode == "continuous" {
         "interactive".into()
     } else {
@@ -440,8 +503,8 @@ fn update_config_impl(
     if !matches!(config.overlay_theme.as_str(), "day" | "night" | "follow") {
         return Err("前台模式必须是 day、night 或 follow".into());
     }
-    if !(10..=48).contains(&config.overlay_font_size) {
-        return Err("字体大小必须在 10 到 48 之间".into());
+    if !(4..=48).contains(&config.overlay_font_size) {
+        return Err("字体大小必须在 4 到 48 之间".into());
     }
     if !(240..=1400).contains(&config.overlay_width)
         || !(160..=1000).contains(&config.overlay_height)
@@ -557,12 +620,53 @@ fn update_config_impl(
         .inner
         .lock()
         .map_err(|_| "application state unavailable")?;
+    if previous_config.simple_mode_enabled != config.simple_mode_enabled {
+        inner.quick_overlay_symbol = None;
+        inner.quick_request_id = None;
+        inner.quick_request_status = None;
+        if previous_config.simple_mode_enabled && !config.simple_mode_enabled {
+            inner.status = "idle".into();
+            inner.answer = None;
+            inner.answer_preset_id = None;
+        }
+    }
     if reset_openai_history {
         inner.openai_history.clear();
     }
     inner.message = Some("配置已保存；变更的快捷键已立即应用。".into());
     drop(inner);
     emit_snapshot(&app, &state);
+    Ok(())
+}
+
+fn apply_simple_mode_config(previous: &AppConfig, next: &mut AppConfig) -> Result<(), String> {
+    if next.simple_mode_enabled && !next.lan_control_enabled {
+        return Err(if previous.simple_mode_enabled {
+            "极简模式开启期间不能关闭局域网控制".into()
+        } else {
+            "启用极简模式前，请先启用局域网控制".into()
+        });
+    }
+    match (previous.simple_mode_enabled, next.simple_mode_enabled) {
+        (false, true) => {
+            next.simple_mode_previous_provider = Some(previous.provider.clone());
+            next.provider = "openai-api".into();
+        }
+        (true, true) => {
+            next.simple_mode_previous_provider = previous.simple_mode_previous_provider.clone();
+            next.provider = "openai-api".into();
+        }
+        (true, false) => {
+            next.provider = previous
+                .simple_mode_previous_provider
+                .clone()
+                .unwrap_or_else(|| "openai-api".into());
+            next.simple_mode_previous_provider = None;
+        }
+        (false, false) => {
+            next.simple_mode_previous_provider = None;
+        }
+    }
     Ok(())
 }
 
@@ -577,7 +681,7 @@ fn adjust_overlay_font_size(
         .lock()
         .map_err(|_| "config state unavailable")?;
     let current = config.overlay_font_size as i32;
-    config.overlay_font_size = (current + delta).clamp(10, 48) as u32;
+    config.overlay_font_size = (current + delta).clamp(4, 48) as u32;
     drop(config);
     persist_config(&state)?;
     emit_snapshot(&app, &state);
@@ -590,8 +694,8 @@ fn set_overlay_font_size(
     state: State<'_, Arc<AppState>>,
     value: u32,
 ) -> Result<(), String> {
-    if !(10..=48).contains(&value) {
-        return Err("字体大小必须在 10 到 48 之间".into());
+    if !(4..=48).contains(&value) {
+        return Err("字体大小必须在 4 到 48 之间".into());
     }
     let mut config = state
         .config
@@ -755,7 +859,7 @@ pub(crate) fn dispatch_remote_command(
     id: String,
     command: String,
     preset_id: String,
-) {
+) -> Result<(), String> {
     let _ = app.emit(
         "command.accepted",
         serde_json::json!({"type":"command.accepted", "id":id, "action":command}),
@@ -764,11 +868,12 @@ pub(crate) fn dispatch_remote_command(
     let result = match command.as_str() {
         "capture" => capture_for_preset(app.clone(), state, preset_id),
         "submit" => submit_draft(app.clone(), state),
+        "quick_solve" => start_quick_solve(app.clone(), id.clone()),
         "clear" => clear_draft(app.clone(), state),
         "cancel" => cancel_current_job(app.clone(), state),
         _ => Err("未知远程命令".into()),
     };
-    if let Err(error) = result {
+    if let Err(error) = &result {
         let _ = app.emit(
             "command.failed",
             serde_json::json!({"type":"command.failed", "id":id, "error":error}),
@@ -779,6 +884,182 @@ pub(crate) fn dispatch_remote_command(
             serde_json::json!({"type":"command.completed", "id":id, "action":command}),
         );
     }
+    result
+}
+
+fn start_quick_solve(app: AppHandle, command_id: String) -> Result<(), String> {
+    if command_id.trim().is_empty() {
+        return Err("极简答题命令缺少命令 ID".into());
+    }
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| "config state unavailable")?
+        .clone();
+    if !config.simple_mode_enabled {
+        return Err("极简模式未启用".into());
+    }
+    if !config.lan_control_enabled {
+        return Err("局域网控制未启用".into());
+    }
+    if config.provider != "openai-api" {
+        return Err("极简模式当前只支持 OpenAI API".into());
+    }
+
+    let trace = TraceContext::new("quick_solve");
+    let protected = {
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "application state unavailable")?;
+        if inner.quick_request_id.as_deref() == Some(command_id.as_str()) {
+            return Ok(());
+        }
+        if matches!(
+            inner.quick_request_status.as_deref(),
+            Some("capturing" | "solving")
+        ) {
+            return Err("极简答题正在处理中".into());
+        }
+        if matches!(inner.status.as_str(), "capturing" | "solving") {
+            inner.quick_request_id = Some(command_id.clone());
+            inner.quick_request_status = Some("failed".into());
+            inner.quick_overlay_symbol = inner.protected_overlay.then(|| "*".into());
+            drop(inner);
+            emit_snapshot(&app, &state);
+            return Err("电脑端有其他任务正在处理中，请稍后重试".into());
+        }
+        inner.quick_request_id = Some(command_id.clone());
+        inner.quick_request_status = Some("capturing".into());
+        inner.quick_overlay_symbol = inner.protected_overlay.then(|| "~".into());
+        inner.answer = None;
+        inner.answer_preset_id = None;
+        inner.status = "capturing".into();
+        inner.trace_id = Some(trace.trace_id.clone());
+        inner.message = Some("极简模式正在截取主屏".into());
+        let protected = inner.protected_overlay;
+        if !protected {
+            inner.quick_request_status = Some("failed".into());
+            inner.quick_overlay_symbol = None;
+            inner.status = "failed".into();
+            inner.message = Some("浮窗捕获保护未确认，拒绝显示答案".into());
+            drop(inner);
+            emit_snapshot(&app, &state);
+            return Err("浮窗捕获保护未确认，拒绝显示答案".into());
+        }
+        protected
+    };
+    emit_snapshot(&app, &state);
+    if protected {
+        let hidden = state
+            .inner
+            .lock()
+            .map_err(|_| "application state unavailable")?
+            .overlay_user_hidden;
+        if !hidden {
+            if let Some(window) = app.get_webview_window("overlay") {
+                if let Err(error) = overlay::show(&window) {
+                    if let Ok(mut inner) = state.inner.lock() {
+                        if inner.quick_request_id.as_deref() == Some(command_id.as_str()) {
+                            inner.quick_overlay_symbol = Some("*".into());
+                            inner.quick_request_status = Some("failed".into());
+                            inner.status = "failed".into();
+                            inner.message = Some(format!("无法显示极简浮窗：{error}"));
+                        }
+                    }
+                    emit_snapshot(&app, &state);
+                    return Err(format!("无法显示极简浮窗：{error}"));
+                }
+            } else {
+                if let Ok(mut inner) = state.inner.lock() {
+                    if inner.quick_request_id.as_deref() == Some(command_id.as_str()) {
+                        inner.quick_overlay_symbol = Some("*".into());
+                        inner.quick_request_status = Some("failed".into());
+                        inner.status = "failed".into();
+                        inner.message = Some("极简浮窗不可用".into());
+                    }
+                }
+                emit_snapshot(&app, &state);
+                return Err("极简浮窗不可用".into());
+            }
+        }
+    }
+
+    let work_dir = state.work_dir.clone();
+    let provider = OpenAiProvider {
+        base_url: config.openai_base_url,
+        api_key: config.openai_api_key,
+        model: config.openai_model,
+        reasoning_effort: config.openai_reasoning_effort,
+        timeout_seconds: config.codex_timeout_seconds,
+        prompt_addendum: String::new(),
+    };
+    let app_for_job = app.clone();
+    let state_for_job = state.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let span = trace.span("quick_solve.capture_and_openai_tool");
+        let result = capture::capture_primary(&work_dir).and_then(|image| {
+            if let Ok(mut inner) = state_for_job.inner.lock() {
+                if inner.quick_request_id.as_deref() == Some(command_id.as_str()) {
+                    inner.quick_request_status = Some("solving".into());
+                    inner.status = "solving".into();
+                    inner.message = Some("极简模式正在识别选择题".into());
+                }
+            }
+            emit_snapshot(&app_for_job, &state_for_job);
+            let draft = QuestionDraft::new("quick-choice".into(), image.clone());
+            let result = provider.solve_choice(&draft, &trace);
+            let _ = fs::remove_file(&image.path);
+            result
+        });
+        drop(span);
+
+        let mut inner = match state_for_job.inner.lock() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if inner.quick_request_id.as_deref() != Some(command_id.as_str()) {
+            return;
+        }
+        match result {
+            Ok(ChoiceToolResult::Choice(choice)) => match choice_dots(choice) {
+                Ok(dots) => {
+                    inner.quick_overlay_symbol = Some(dots);
+                    inner.quick_request_status = Some("succeeded".into());
+                    inner.status = "displaying".into();
+                    inner.message = Some("极简答案已生成".into());
+                }
+                Err(error) => {
+                    inner.quick_overlay_symbol = Some("*".into());
+                    inner.quick_request_status = Some("failed".into());
+                    inner.status = "failed".into();
+                    inner.message = Some(error.to_string());
+                }
+            },
+            Ok(ChoiceToolResult::Unreadable(reason)) => {
+                inner.quick_overlay_symbol = Some("*".into());
+                inner.quick_request_status = Some("failed".into());
+                inner.status = "failed".into();
+                inner.message = Some(format!("无法识别选择题：{reason}"));
+            }
+            Err(error) => {
+                inner.quick_overlay_symbol = Some("*".into());
+                inner.quick_request_status = Some("failed".into());
+                inner.status = "failed".into();
+                inner.message = Some(format!("极简答题失败：{error}"));
+            }
+        }
+        let can_show = inner.protected_overlay && !inner.overlay_user_hidden;
+        drop(inner);
+        if can_show {
+            if let Some(window) = app_for_job.get_webview_window("overlay") {
+                let _ = overlay::show(&window);
+            }
+        }
+        emit_snapshot(&app_for_job, &state_for_job);
+    });
+    Ok(())
 }
 fn emit_snapshot(app: &AppHandle, state: &AppState) {
     let _ = app.emit("state-changed", state.snapshot());
@@ -793,6 +1074,28 @@ fn remove_draft_images(draft: &QuestionDraft) {
 #[tauri::command]
 fn get_snapshot(state: State<'_, Arc<AppState>>) -> Snapshot {
     state.snapshot()
+}
+
+#[tauri::command]
+fn detect_local_ipv4() -> Result<String, String> {
+    // Connecting a UDP socket selects the OS route and local source address;
+    // no packet is sent. This picks the address a phone should use on the
+    // machine's preferred network interface.
+    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|error| format!("无法探测本机 IPv4 地址：{error}"))?;
+    socket
+        .connect(("1.1.1.1", 80))
+        .map_err(|error| format!("无法探测本机 IPv4 地址：{error}"))?;
+    let address = socket
+        .local_addr()
+        .map_err(|error| format!("无法读取本机 IPv4 地址：{error}"))?;
+    let std::net::IpAddr::V4(ip) = address.ip() else {
+        return Err("未检测到可供手机访问的 IPv4 地址".into());
+    };
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() {
+        return Err("未检测到可供手机访问的局域网 IPv4 地址".into());
+    }
+    Ok(ip.to_string())
 }
 
 #[tauri::command]
@@ -1010,6 +1313,7 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
                 base_url: config.openai_base_url,
                 api_key: config.openai_api_key,
                 model: config.openai_model,
+                reasoning_effort: config.openai_reasoning_effort,
                 timeout_seconds: config.codex_timeout_seconds,
                 prompt_addendum: config.prompt_addendum,
             }
@@ -1630,10 +1934,13 @@ fn main() {
                     .get("command")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                if !matches!(command, "capture" | "submit" | "clear" | "cancel") {
+                if !matches!(
+                    command,
+                    "capture" | "submit" | "quick_solve" | "clear" | "cancel"
+                ) {
                     return;
                 }
-                crate::dispatch_remote_command(
+                let _ = crate::dispatch_remote_command(
                     remote_app.clone(),
                     payload
                         .get("id")
@@ -1693,6 +2000,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            detect_local_ipv4,
             capture_for_preset,
             clear_draft,
             submit_draft,
@@ -1711,6 +2019,87 @@ fn main() {
             list_codex_threads,
             select_codex_thread
         ])
-        .run(tauri::generate_context!())
+.run(tauri::generate_context!())
         .expect("宝宝巴士启动失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_mode_is_disabled_for_new_and_legacy_configs() {
+        let config = AppConfig::default();
+        assert!(!config.simple_mode_enabled);
+        assert_eq!(config.simple_mode_previous_provider, None);
+        let legacy: AppConfig = serde_json::from_value(serde_json::json!({"provider":"codex-cli"}))
+            .expect("legacy config uses defaults for new fields");
+        assert!(!legacy.simple_mode_enabled);
+        assert_eq!(legacy.simple_mode_previous_provider, None);
+        assert_eq!(legacy.openai_reasoning_effort, "low");
+    }
+
+    #[test]
+    fn simple_mode_requires_lan_and_cannot_turn_it_off() {
+        let previous = AppConfig::default();
+        let mut enabling = previous.clone();
+        enabling.simple_mode_enabled = true;
+        assert!(apply_simple_mode_config(&previous, &mut enabling)
+            .unwrap_err()
+            .contains("先启用局域网控制"));
+
+        let mut previous_enabled = AppConfig::default();
+        previous_enabled.simple_mode_enabled = true;
+        previous_enabled.lan_control_enabled = true;
+        let mut disabling_lan = previous_enabled.clone();
+        disabling_lan.lan_control_enabled = false;
+        assert!(
+            apply_simple_mode_config(&previous_enabled, &mut disabling_lan)
+                .unwrap_err()
+                .contains("不能关闭局域网控制")
+        );
+    }
+
+    #[test]
+    fn simple_mode_switches_to_openai_and_restores_the_previous_provider() {
+        let mut previous = AppConfig::default();
+        previous.lan_control_enabled = true;
+        previous.provider = "claude-code-cli".into();
+        let mut enabled = previous.clone();
+        enabled.simple_mode_enabled = true;
+        apply_simple_mode_config(&previous, &mut enabled).expect("enable simple mode");
+        assert_eq!(enabled.provider, "openai-api");
+        assert_eq!(
+            enabled.simple_mode_previous_provider.as_deref(),
+            Some("claude-code-cli")
+        );
+
+        let mut still_enabled = enabled.clone();
+        still_enabled.provider = "codex-cli".into();
+        apply_simple_mode_config(&enabled, &mut still_enabled).expect("provider remains locked");
+        assert_eq!(still_enabled.provider, "openai-api");
+        assert_eq!(
+            still_enabled.simple_mode_previous_provider.as_deref(),
+            Some("claude-code-cli")
+        );
+
+        let mut disabled = still_enabled.clone();
+        disabled.simple_mode_enabled = false;
+        apply_simple_mode_config(&still_enabled, &mut disabled).expect("disable simple mode");
+        assert_eq!(disabled.provider, "claude-code-cli");
+        assert_eq!(disabled.simple_mode_previous_provider, None);
+    }
+
+    #[test]
+    fn simple_mobile_snapshot_does_not_serialize_answer_or_configuration() {
+        let snapshot = simple_mobile_snapshot("solving", Some("cmd-1"), Some("solving"));
+        assert_eq!(
+            snapshot["config"],
+            serde_json::json!({"simple_mode_enabled": true})
+        );
+        assert_eq!(snapshot["quick_request_id"], "cmd-1");
+        assert!(snapshot.get("answer").is_none());
+        assert!(snapshot.get("draft").is_none());
+        assert!(snapshot.get("openai_api_key").is_none());
+    }
 }

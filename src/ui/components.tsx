@@ -142,15 +142,18 @@ export function ProviderCard({ config, setConfig, threadId }: { config: Config; 
   const modelLabel = selectedModel?.displayName || selectedModel?.id || "CLI 默认模型";
   return <Card className="panel-card" title={<span><IconSettings /> Provider 与模型</span>}>
     <div className="form-grid">
-      <div className="form-field"><span className="field-label-text">答题 Provider</span><Select value={config.provider} onChange={v => setConfig(c => ({ ...c, provider: v }))}><Select.Option value="codex-cli">Codex CLI</Select.Option><Select.Option value="openai-api">OpenAI API</Select.Option><Select.Option value="claude-code-cli">Claude Code CLI</Select.Option></Select></div>
-      {config.provider !== "claude-code-cli" ? <><label className="switch-line">截图后直接提交<Switch checked={config.auto_submit_after_capture} onChange={value => setConfig(c => ({ ...c, auto_submit_after_capture: value }))} /></label><label className="switch-line">连续对话<Switch checked={config.conversation_mode === "continuous"} onChange={value => setConfig(c => ({ ...c, conversation_mode: value ? "continuous" : "single", codex_execution_mode: value ? "interactive" : "exec" }))} /></label></> : null}
+      <div className="form-field"><span className="field-label-text">答题 Provider</span><Select disabled={config.simple_mode_enabled} value={config.provider} onChange={v => setConfig(c => ({ ...c, provider: v }))}><Select.Option value="codex-cli">Codex CLI</Select.Option><Select.Option value="openai-api">OpenAI API</Select.Option><Select.Option value="claude-code-cli">Claude Code CLI</Select.Option></Select></div>
+      <label className="switch-line">极简模式（A–F 单选题）<Switch checked={config.simple_mode_enabled} disabled={!config.lan_control_enabled} onChange={enabled => setConfig(c => enabled
+        ? { ...c, simple_mode_enabled: true, simple_mode_previous_provider: c.provider, provider: "openai-api" }
+        : { ...c, simple_mode_enabled: false, provider: c.simple_mode_previous_provider || "openai-api", simple_mode_previous_provider: null })} /></label>
+      {!config.simple_mode_enabled && config.provider !== "claude-code-cli" ? <><label className="switch-line">截图后直接提交<Switch checked={config.auto_submit_after_capture} onChange={value => setConfig(c => ({ ...c, auto_submit_after_capture: value }))} /></label><label className="switch-line">连续对话<Switch checked={config.conversation_mode === "continuous"} onChange={value => setConfig(c => ({ ...c, conversation_mode: value ? "continuous" : "single", codex_execution_mode: value ? "interactive" : "exec" }))} /></label></> : null}
       {config.provider === "codex-cli" && config.conversation_mode === "continuous" ? <div className="form-field"><span className="field-label-text">已有会话</span><Select showSearch allowClear loading={threadsLoading} value={threadId || snapshot.interactive_thread_id} onChange={v => { if (v === "__new__") { void invoke("select_codex_thread", { threadId: "new" }); } else if (v) void invoke("select_codex_thread", { threadId: v }); }} placeholder={threadsLoading ? "正在读取会话…" : threadsError ? "会话读取失败" : threads.length ? "选择已有 Codex 会话" : "暂无可用会话"}><Select.Option value="__new__">新建会话（提交时自动创建）</Select.Option>{threads.map(thread => <Select.Option key={thread.id} value={thread.id}>{thread.name || thread.id}{formatThreadDate(thread.updatedAt) ? ` · ${formatThreadDate(thread.updatedAt)}` : ""}</Select.Option>)}</Select>{threadsError ? <Alert type="error" showIcon content={<span>读取 Codex 会话失败：<code>{threadsError}</code></span>} /> : !threadsLoading && !threads.length ? <div className="provider-hint">当前没有可列出的未归档会话。</div> : null}</div> : null}
       {config.provider !== "openai-api" ? <label>CLI 路径<Input value={config.codex_path} onChange={v => setConfig(c => ({ ...c, codex_path: v }))} placeholder="codex 或 claude" /></label> : null}
-      {config.provider === "openai-api" ? <><label>API Base URL<Input value={config.openai_base_url} onChange={v => setConfig(c => ({ ...c, openai_base_url: v }))} placeholder="https://api.openai.com" /></label><label>API Key<Input.Password value={config.openai_api_key} onChange={v => setConfig(c => ({ ...c, openai_api_key: v }))} placeholder="留空则使用 OPENAI_API_KEY" /></label><label>OpenAI 模型<Input value={config.openai_model} onChange={v => setConfig(c => ({ ...c, openai_model: v }))} placeholder="gpt-4o-mini" /></label></> : null}
+      {config.provider === "openai-api" ? <><label>API Base URL<Input value={config.openai_base_url} onChange={v => setConfig(c => ({ ...c, openai_base_url: v }))} placeholder="https://api.deepseek.com" /></label><label>API Key<Input.Password value={config.openai_api_key} onChange={v => setConfig(c => ({ ...c, openai_api_key: v }))} placeholder="留空则使用 OPENAI_API_KEY" /></label><label>OpenAI 模型<Input value={config.openai_model} onChange={v => setConfig(c => ({ ...c, openai_model: v }))} placeholder="deepseek-flash" /></label><div className="form-field"><span className="field-label-text">推理强度（reasoning_effort）</span><Select value={config.openai_reasoning_effort} onChange={value => setConfig(c => ({ ...c, openai_reasoning_effort: value }))}><Select.Option value="low">low · 精简推理</Select.Option><Select.Option value="high">high · 深度推理</Select.Option><Select.Option value="max">max · 最大推理</Select.Option></Select></div></> : null}
       {config.provider === "codex-cli" ? <><div className="form-field"><span className="field-label-text">模型</span><Select showSearch allowClear value={config.codex_model || undefined} loading={loading} onChange={v => setConfig(c => ({ ...c, codex_model: v ?? "" }))} placeholder={loading ? "正在读取模型…" : "选择模型"}>{models.map(model => <Select.Option key={model.id} value={model.id}>{model.displayName ? `${model.displayName} · ${model.id}` : model.id}</Select.Option>)}</Select></div><div className="form-field"><span className="field-label-text">推理深度</span><Select value={config.codex_reasoning_effort || "__default__"} onChange={v => setConfig(c => ({ ...c, codex_reasoning_effort: v === "__default__" ? "" : v }))}><Select.Option value="__default__">跟随模型默认（{selectedModel?.defaultReasoningEffort || "CLI"}）</Select.Option>{reasoningOptions.map(option => <Select.Option key={option.reasoningEffort} value={option.reasoningEffort}>{option.reasoningEffort}{option.description ? ` · ${option.description}` : ""}</Select.Option>)}{!reasoningKnown && config.codex_reasoning_effort ? <Select.Option value={config.codex_reasoning_effort}>{config.codex_reasoning_effort} · 当前配置</Select.Option> : null}</Select></div><div className="form-field"><span className="field-label-text">速度模式</span><Select value={serviceTier} onChange={v => setConfig(c => ({ ...c, codex_service_tier: v }))}><Select.Option value="default">标准 · 1×</Select.Option><Select.Option value="priority" disabled={Boolean(selectedModel && !fastSupported)}>Fast · 约 1.5×{selectedModel && !fastSupported ? "（当前模型不可用）" : ""}</Select.Option></Select></div></> : null}
-      <label>超时（秒）<InputNumber min={10} max={3600} value={config.codex_timeout_seconds} onChange={v => setConfig(c => ({ ...c, codex_timeout_seconds: Number(v || 120) }))} /></label>
+      <label>{config.simple_mode_enabled ? "请求超时（秒）" : "超时（秒）"}<InputNumber min={10} max={3600} value={config.codex_timeout_seconds} onChange={v => setConfig(c => ({ ...c, codex_timeout_seconds: Number(v || 120) }))} /></label>
     </div>
-    <div className="provider-hint">{config.provider === "openai-api" ? (config.conversation_mode === "continuous" ? "OpenAI API 连续模式会由本机保存并在下一次请求重发聊天记录；清空草稿会重置该记录。" : "OpenAI API 单轮模式每次独立请求，不保留聊天记录。") : `已读取 ${models.length || "当前"} 个 CLI 模型；当前模型：${modelLabel}。${config.conversation_mode === "continuous" ? "连续模式会复用 Codex thread，上下文仅在清空时归档。" : "单轮模式每次独立执行。"} Fast 使用 service_tier=priority，仅在模型/账号提供该层时可用。`}</div>
+    <div className="provider-hint">{config.simple_mode_enabled ? "极简模式只处理一次手机触发的截图，使用 OpenAI API 工具调用识别 A–F 单选题；关闭后恢复原 Provider。局域网控制保持开启。" : !config.lan_control_enabled ? "先开启局域网控制，才能启用极简模式。" : config.provider === "openai-api" ? (config.conversation_mode === "continuous" ? "OpenAI API 连续模式会由本机保存并在下一次请求重发聊天记录；清空草稿会重置该记录。" : "OpenAI API 单轮模式每次独立请求，不保留聊天记录。") : `已读取 ${models.length || "当前"} 个 CLI 模型；当前模型：${modelLabel}。${config.conversation_mode === "continuous" ? "连续模式会复用 Codex thread，上下文仅在清空时归档。" : "单轮模式每次独立执行。"} Fast 使用 service_tier=priority，仅在模型/账号提供该层时可用。`}</div>
     <div className="current-value"><Tag color="green">当前生效 Provider：{config.provider === "codex-cli" ? "Codex CLI" : config.provider === "openai-api" ? "OpenAI API" : "Claude Code CLI"}</Tag><Tag color="arcoblue">当前模型：{config.provider === "openai-api" ? config.openai_model : config.codex_model || modelLabel}</Tag>{config.provider === "openai-api" && config.conversation_mode === "continuous" ? <Tag color="purple">连续上下文：{snapshot.openai_history_turn_count} 轮</Tag> : null}{config.provider === "codex-cli" ? <><Tag color="arcoblue">推理：{config.codex_reasoning_effort || `模型默认（${currentReasoning}）`}</Tag><Tag color={serviceTier === "priority" ? "orange" : "gray"}>速度：{serviceTier === "priority" ? "Fast · 约 1.5×" : "标准 · 1×"}</Tag></> : null}</div>
   </Card>;
 }
@@ -158,7 +161,8 @@ export function ProviderCard({ config, setConfig, threadId }: { config: Config; 
 export function DisplayCard({ config, setConfig }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>> }) {
   const update = async (field: "overlay_opacity" | "overlay_font_size", value: number) => {
     setConfig(c => ({ ...c, [field]: value }));
-    try { await invoke(field === "overlay_opacity" ? "set_overlay_opacity" : "set_overlay_font_size", { value }); } catch { /* saved on submit */ }
+    const command = field === "overlay_opacity" ? "set_overlay_opacity" : "set_overlay_font_size";
+    try { await invoke(command, { value }); } catch { /* saved on submit */ }
   };
   return <Card className="panel-card" title={<span><IconSettings /> 浮窗显示</span>}>
     <div className="form-grid">
@@ -166,15 +170,65 @@ export function DisplayCard({ config, setConfig }: { config: Config; setConfig: 
       <label>窗口宽度<InputNumber min={280} max={1600} value={config.overlay_width} onChange={v => setConfig(c => ({ ...c, overlay_width: Number(v || 560) }))} /></label>
       <label>窗口高度<InputNumber min={160} max={1200} value={config.overlay_height} onChange={v => setConfig(c => ({ ...c, overlay_height: Number(v || 420) }))} /></label>
       <label>透明度 <span className="value-badge">{Math.round(config.overlay_opacity * 100)}%</span><Slider min={0.2} max={1} step={0.01} value={config.overlay_opacity} onChange={v => void update("overlay_opacity", Number(v))} /></label>
-      <label>字体大小 <span className="value-badge">{config.overlay_font_size}px</span><Slider min={12} max={48} value={config.overlay_font_size} onChange={v => void update("overlay_font_size", Number(v))} /></label>
+      <label>字体大小 <span className="value-badge">{config.overlay_font_size}px</span><Slider min={4} max={48} value={config.overlay_font_size} onChange={v => void update("overlay_font_size", Number(v))} /></label>
     </div>
   </Card>;
 }
 
 export function LanControlCard({ config, setConfig }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>> }) {
+  const { notify, snapshot } = useAppState();
+  const [localIp, setLocalIp] = useState("");
+  const [ipLoading, setIpLoading] = useState(false);
+  const [ipError, setIpError] = useState("");
+  const refreshAddress = async () => {
+    setIpLoading(true);
+    setIpError("");
+    try {
+      setLocalIp(await invoke<string>("detect_local_ipv4"));
+    } catch (error) {
+      setLocalIp("");
+      setIpError(String(error));
+    } finally {
+      setIpLoading(false);
+    }
+  };
+  useEffect(() => { void refreshAddress(); }, []);
+  const phoneUrl = localIp ? `http://${localIp}:${config.lan_control_port}/` : "";
+  const networkSettingsPending = config.lan_control_enabled !== snapshot.config.lan_control_enabled
+    || config.lan_control_port !== snapshot.config.lan_control_port;
+  const copyAddress = async () => {
+    if (!phoneUrl || !config.lan_control_enabled) return;
+    try {
+      try {
+        await navigator.clipboard.writeText(phoneUrl);
+      } catch {
+        const input = document.createElement("textarea");
+        input.value = phoneUrl;
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        const copied = document.execCommand("copy");
+        input.remove();
+        if (!copied) throw new Error("剪贴板不可用");
+      }
+      notify("success", "手机访问地址已复制");
+    } catch (error) {
+      notify("error", `复制手机访问地址失败：${String(error)}`);
+    }
+  };
   return <Card className="panel-card" title="局域网手机控制">
-    <div className="form-grid"><label className="switch-line">启用局域网控制<Switch checked={config.lan_control_enabled} onChange={v => setConfig(c => ({ ...c, lan_control_enabled: v }))} /></label><label>端口<InputNumber min={1024} max={65535} value={config.lan_control_port} onChange={v => setConfig(c => ({ ...c, lan_control_port: Number(v || 18765) }))} /></label></div>
+    <div className="form-grid"><label className="switch-line">启用局域网控制<Switch checked={config.lan_control_enabled} disabled={config.simple_mode_enabled} onChange={v => setConfig(c => ({ ...c, lan_control_enabled: v }))} /></label><label>端口<InputNumber min={1024} max={65535} value={config.lan_control_port} onChange={v => setConfig(c => ({ ...c, lan_control_port: Number(v || 18765) }))} /></label></div>
     <label className="switch-line">手机自动保存完整截图<Switch checked={config.mobile_auto_save_images} onChange={v => setConfig(c => ({ ...c, mobile_auto_save_images: v }))} /></label>
+    <div className="lan-address-panel">
+      <div className="lan-address-head"><strong>手机访问地址</strong><Space size={4}>
+        <ArcoButton type="text" size="small" icon={<IconRefresh />} loading={ipLoading} onClick={() => void refreshAddress()} aria-label="刷新本机 IP 地址" />
+        <ArcoButton type="text" size="small" icon={<IconCopy />} disabled={!phoneUrl || !config.lan_control_enabled} onClick={() => void copyAddress()} aria-label="复制手机访问地址" />
+      </Space></div>
+      <Input value={phoneUrl} readOnly placeholder={ipLoading ? "正在探测本机 IP 地址…" : "未检测到本机 IPv4 地址，可点击刷新"} />
+      <Text type="secondary">{!config.lan_control_enabled ? "开启并保存局域网控制后，手机才能访问此地址。" : networkSettingsPending ? "保存配置后生效；手机和电脑需连接同一局域网。" : "手机和电脑连接同一局域网后可打开此地址。"}</Text>
+      {ipError ? <Text type="secondary">{ipError}</Text> : null}
+    </div>
     <Text type="secondary">关闭局域网控制后会释放监听端口；端口和开关未变化时不会重复重启服务。</Text><Text type="secondary">手机业务数据使用临时 ECDH 会话与 AES-256-GCM 加密传输。</Text>
   </Card>;
 }
@@ -277,7 +331,7 @@ export function OverlayApp() {
     return () => { disposed = true; unlisten?.(); };
   }, []);
   useEffect(() => { answerRef.current?.scrollTo({ top: 0 }); }, [snapshot.answer?.text]);  useEffect(() => {
-    if (snapshot.config.overlay_theme !== "follow") return;
+    if (snapshot.config.simple_mode_enabled || snapshot.config.overlay_theme !== "follow") return;
     let active = true;
     const sample = async () => {
       try {
@@ -289,12 +343,16 @@ export function OverlayApp() {
     void sample();
     const timer = window.setInterval(() => void sample(), 1800);
     return () => { active = false; window.clearInterval(timer); };
-  }, [snapshot.config.overlay_theme]);
+  }, [snapshot.config.overlay_theme, snapshot.config.simple_mode_enabled]);
   const luminance = (0.2126 * background[0] + 0.7152 * background[1] + 0.0722 * background[2]) / 255;
   const darkPanel = snapshot.config.overlay_theme === "night" ? true : snapshot.config.overlay_theme === "day" ? false : luminance < 0.54;
   const alpha = Math.max(0.12, Math.min(0.95, snapshot.config.overlay_opacity));
   const panel = darkPanel ? "rgba(10, 18, 30, " + alpha + ")" : "rgba(248, 251, 255, " + alpha + ")";
   const textAlpha = Math.max(0.74, Math.min(1, alpha + 0.12));
   const foreground = darkPanel ? "rgba(248, 251, 255, " + textAlpha + ")" : "rgba(16, 24, 39, " + textAlpha + ")";
+  if (snapshot.config.simple_mode_enabled) {
+    const symbol = snapshot.protected_overlay ? snapshot.quick_overlay_symbol : undefined;
+    return <div className="overlay-root simple-overlay">{symbol ? <div className="simple-overlay-symbol" style={{ color: "#000", opacity: snapshot.config.overlay_opacity, fontSize: snapshot.config.overlay_font_size }}>{symbol}</div> : null}</div>;
+  }
   return <div className="overlay-root"><div className="overlay-content" style={{ backgroundColor: panel, color: foreground, fontSize: snapshot.config.overlay_font_size }}><div className="overlay-meta" style={{ color: darkPanel ? "rgba(255,255,255,.74)" : "rgba(16,24,39,.72)" }}><span>宝宝巴士 · {snapshot.draft?.image_count ?? 0} 张图片</span><span>{snapshot.status}</span></div>{snapshot.draft?.thumbnails?.length ? <div className="overlay-thumbs">{snapshot.draft.thumbnails.map((src, i) => <img key={i} src={src} alt={"题图 " + (i + 1)} />)}</div> : null}{snapshot.answer?.text ? <div ref={answerRef} className="overlay-answer">{snapshot.answer.text}</div> : <div className="overlay-wait" style={{ color: darkPanel ? "rgba(255,255,255,.72)" : "rgba(16,24,39,.68)" }}>等待答案…</div>}</div></div>;
 }

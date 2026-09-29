@@ -372,7 +372,7 @@ fn read_ws_commands(mut reader: TcpStream, app: AppHandle, key: [u8; 32]) {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         let command = match action {
-            "capture" | "submit" | "clear" | "cancel" => action,
+            "capture" | "submit" | "quick_solve" | "clear" | "cancel" => action,
             _ => continue,
         };
         let preset_id = value
@@ -385,7 +385,7 @@ fn read_ws_commands(mut reader: TcpStream, app: AppHandle, key: [u8; 32]) {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_owned();
-        crate::dispatch_remote_command(app.clone(), id, command.to_owned(), preset_id);
+        let _ = crate::dispatch_remote_command(app.clone(), id, command.to_owned(), preset_id);
     }
 }
 
@@ -534,7 +534,8 @@ fn handle(
     };
 
     if method == "GET" && route == "/api/state" {
-        let plaintext = serde_json::to_vec(&state.snapshot()).unwrap_or_else(|_| b"{}".to_vec());
+        let plaintext =
+            serde_json::to_vec(&state.mobile_snapshot()).unwrap_or_else(|_| b"{}".to_vec());
         let encrypted = encrypt_bytes(&session_key, &plaintext).unwrap_or_else(|_| "{}".into());
         return write_response(
             stream,
@@ -565,7 +566,7 @@ fn handle(
         let mut last_plaintext = Vec::new();
         let mut last_ping = Instant::now();
         loop {
-            let packet = json!({"type":"state.snapshot", "snapshot": state.snapshot()});
+            let packet = json!({"type":"state.snapshot", "snapshot": state.mobile_snapshot()});
             let plaintext = serde_json::to_vec(&packet).unwrap_or_else(|_| b"{}".to_vec());
             if plaintext != last_plaintext {
                 let encrypted = match encrypt_bytes(&session_key, &plaintext) {
@@ -593,6 +594,7 @@ fn handle(
             "/api/submit",
             "/api/clear",
             "/api/cancel",
+            "/api/quick-solve",
             "/api/config",
         ]
         .contains(&route)
@@ -649,6 +651,7 @@ fn handle(
             "/api/capture" => "capture",
             "/api/submit" => "submit",
             "/api/clear" => "clear",
+            "/api/quick-solve" => "quick_solve",
             _ => "cancel",
         };
         let command_id = value
@@ -659,25 +662,31 @@ fn handle(
             .get("presetId")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("general");
-        crate::dispatch_remote_command(
+        let dispatched = crate::dispatch_remote_command(
             app.clone(),
             command_id.to_owned(),
             command.to_owned(),
             preset.to_owned(),
         );
+        let (status, response_value) = if command == "quick_solve" {
+            match dispatched {
+                Ok(()) => ("202 Accepted", json!({"accepted": true, "id": command_id})),
+                Err(error) => (
+                    "409 Conflict",
+                    json!({"accepted": false, "id": command_id, "error": error}),
+                ),
+            }
+        } else {
+            ("202 Accepted", json!({"accepted": true, "id": command_id}))
+        };
         let response = encrypt_bytes(
             &session_key,
-            serde_json::to_string(&json!({"accepted": true, "id": command_id}))
+            serde_json::to_string(&response_value)
                 .unwrap_or_else(|_| "{}".into())
                 .as_bytes(),
         )
         .unwrap_or_else(|_| "{}".into());
-        return write_response(
-            stream,
-            "202 Accepted",
-            "application/json; charset=utf-8",
-            &response,
-        );
+        return write_response(stream, status, "application/json; charset=utf-8", &response);
     }
     write_response(
         stream,

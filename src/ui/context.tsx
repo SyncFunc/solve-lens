@@ -21,9 +21,12 @@ const fallbackConfig: Config = {
   codex_execution_mode: "exec",
   auto_submit_after_capture: false,
   conversation_mode: "single",
-  openai_base_url: "https://api.openai.com",
+  simple_mode_enabled: false,
+  simple_mode_previous_provider: null,
+  openai_base_url: "https://api.deepseek.com",
   openai_api_key: "",
-  openai_model: "gpt-4o-mini",
+  openai_model: "deepseek-flash",
+  openai_reasoning_effort: "low",
   overlay_opacity: 0.86,
   overlay_theme: "follow",
   overlay_font_size: 20,
@@ -129,7 +132,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const baseline = snapshot.config;
     const patch: Record<string, unknown> = {};
     const scalarFields: (keyof Config)[] = [
-      "provider", "codex_path", "codex_execution_mode", "auto_submit_after_capture", "conversation_mode", "openai_base_url", "openai_api_key", "openai_model", "overlay_opacity", "overlay_theme", "overlay_font_size",
+      "provider", "codex_path", "codex_execution_mode", "auto_submit_after_capture", "conversation_mode", "simple_mode_enabled", "openai_base_url", "openai_api_key", "openai_model", "openai_reasoning_effort", "overlay_opacity", "overlay_theme", "overlay_font_size",
       "overlay_width", "overlay_height", "codex_timeout_seconds", "codex_model", "codex_reasoning_effort", "codex_service_tier",
       "prompt_addendum", "lan_control_enabled", "lan_control_port", "mobile_auto_save_images",
     ];

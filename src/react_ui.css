@@ -90,6 +90,11 @@ body, button, input, textarea, select { font-family: inherit; }
 .value-badge { float: right; color: var(--bb-primary); font-size: 12px; font-variant-numeric: tabular-nums; }
 .provider-hint { margin-top: 12px; padding: 9px 11px; border: 1px solid var(--bb-border); border-radius: 8px; color: var(--bb-muted); background: var(--bb-primary-soft); font-size: 12px; line-height: 1.55; }
 .provider-hint code { color: var(--bb-text); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.lan-address-panel { display: grid; gap: 8px; margin: 14px 0; padding: 12px; border: 1px solid var(--bb-border); border-radius: 10px; background: rgba(255, 255, 255, .035); }
+.lan-address-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--bb-text); font-size: 13px; font-weight: 700; }
+.lan-address-panel .arco-input-wrapper { min-width: 0; border-color: var(--bb-border-strong) !important; border-radius: 8px !important; background: var(--bb-panel-2) !important; }
+.lan-address-panel .arco-input { color: var(--bb-text) !important; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 13px; }
+.lan-address-panel .arco-typography-secondary { color: var(--bb-muted) !important; font-size: 12px; line-height: 1.45; }
 .current-value { margin-top: 14px; gap: 7px; }
 .hotkey-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 16px; }
 .hotkey-hint { margin: 13px 0; color: var(--bb-muted); font-size: 12px; }
@@ -132,6 +137,8 @@ body, button, input, textarea, select { font-family: inherit; }
 /* Overlay must remain a truly transparent, non-interactive surface. */
 .overlay-window, .overlay-window body, .overlay-window #app { background: transparent !important; background-image: none !important; }
 .overlay-root { width: 100vw; height: 100vh; overflow: hidden; pointer-events: none; background: transparent; }
+.overlay-root.simple-overlay { display: flex; align-items: center; justify-content: center; background: transparent; }
+.simple-overlay-symbol { max-width: 100%; overflow: hidden; background: transparent; font-family: Consolas, "Cascadia Mono", monospace; font-weight: 700; line-height: 1; letter-spacing: .06em; white-space: nowrap; }
 .overlay-content { box-sizing: border-box; display: inline-block; max-width: 100%; max-height: 100%; padding: 15px 18px; overflow: hidden; color: #f7fbff; pointer-events: none; }
 .overlay-meta { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; color: rgba(255, 255, 255, .74); font-size: .7em; }
 .overlay-thumbs { display: flex; gap: 6px; margin-bottom: 9px; opacity: .82; }

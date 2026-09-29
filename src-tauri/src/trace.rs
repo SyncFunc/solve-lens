@@ -24,6 +24,25 @@ impl TraceContext {
     pub fn error(&self, message: &str) {
         emit(json!({"event":"trace.error","trace_id":self.trace_id,"message":message}));
     }
+
+    pub fn model_response(
+        &self,
+        provider: &str,
+        model: &str,
+        reasoning_content: Option<&serde_json::Value>,
+        content: Option<&serde_json::Value>,
+        tool_calls: Option<&serde_json::Value>,
+    ) {
+        emit(json!({
+            "event":"model.response",
+            "trace_id":self.trace_id,
+            "provider":provider,
+            "model":model,
+            "reasoning_content":reasoning_content.cloned().unwrap_or(serde_json::Value::Null),
+            "content":content.cloned().unwrap_or(serde_json::Value::Null),
+            "tool_calls":tool_calls.cloned().unwrap_or(serde_json::Value::Null)
+        }));
+    }
 }
 
 pub struct TraceSpan {

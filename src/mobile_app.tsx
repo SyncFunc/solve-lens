@@ -10,8 +10,21 @@ import "./mobile_ui.css";
 import type { Snapshot } from "./ui_types";
 
 const { Title, Text, Paragraph } = Typography;
-type MobileState = Pick<Snapshot, "status" | "message" | "answer" | "draft" | "config" | "interactive_thread_id" | "has_openai_history" | "openai_history_turn_count"> & { presets?: Snapshot["presets"] };
+type MobileState = {
+  status: string;
+  message?: string;
+  answer?: Snapshot["answer"];
+  draft?: Snapshot["draft"];
+  config: Partial<Snapshot["config"]>;
+  interactive_thread_id?: Snapshot["interactive_thread_id"];
+  has_openai_history?: Snapshot["has_openai_history"];
+  openai_history_turn_count?: Snapshot["openai_history_turn_count"];
+  presets?: Snapshot["presets"];
+  quick_request_id?: string | null;
+  quick_request_status?: string | null;
+};
 type Pending = { id: string; kind: "capture" | "submit" | "clear" | "cancel"; before: number };
+type QuickAttempt = { id: string; stage: "sending" | "accepted" | "succeeded" | "failed" };
 type MobileSettingsPatch = Partial<Pick<Snapshot["config"], "auto_submit_after_capture" | "conversation_mode">>;
 type CryptoKeyMaterial = CryptoKey | Uint8Array;
 type CryptoSession = { id: string; key: CryptoKeyMaterial; native: boolean };
@@ -102,6 +115,7 @@ function MobileApp() {
   const [connection, setConnection] = useState<"connecting" | "connected" | "reconnecting" | "failed">("connecting");
   const [toast, setToast] = useState<{ level: "info" | "success" | "error"; text: string } | undefined>(undefined);
   const [pending, setPending] = useState<Pending | undefined>(undefined);
+  const [quickAttempt, setQuickAttempt] = useState<QuickAttempt | undefined>(undefined);
   const [settingsUpdating, setSettingsUpdating] = useState(false);
   const [preset, setPreset] = useState("general");
   const wsRef = useRef<WebSocket | undefined>(undefined);
@@ -113,10 +127,17 @@ function MobileApp() {
   const alive = useRef(true);
   const toastTimer = useRef<number | undefined>(undefined);
   const pendingTimer = useRef<number | undefined>(undefined);
+  const quickTimer = useRef<number | undefined>(undefined);
   const pendingPollTimer = useRef<number | undefined>(undefined);
+  const quickPollTimer = useRef<number | undefined>(undefined);
   const downloadedCount = useRef(0);
   const notify = useCallback((level: "info" | "success" | "error", text: string) => { setToast({ level, text }); if (toastTimer.current) clearTimeout(toastTimer.current); toastTimer.current = window.setTimeout(() => setToast(undefined), 3200); }, []);
-  const applyState = useCallback((next: MobileState) => { if (!alive.current || !next) return; setState(prev => ({ ...(prev ?? {}), ...next })); }, []);
+  const applyState = useCallback((next: MobileState) => {
+    if (!alive.current || !next) return;
+    setState(prev => next.config?.simple_mode_enabled
+      ? { status: next.status, config: next.config, quick_request_id: next.quick_request_id, quick_request_status: next.quick_request_status }
+      : ({ ...(prev ?? {}), ...next }));
+  }, []);
   const ensureCryptoSession = useCallback((): Promise<CryptoSession> => {
     if (cryptoRef.current) return Promise.resolve(cryptoRef.current);
     if (!cryptoPromiseRef.current) {
@@ -157,7 +178,7 @@ function MobileApp() {
       retryTimer.current = window.setTimeout(connect, delay);
     });
   }, [applyState, ensureCryptoSession, poll]);  useEffect(() => { document.documentElement.dataset.theme = state?.config.overlay_theme === "day" ? "day" : "night"; }, [state?.config.overlay_theme]);
-  useEffect(() => { alive.current = true; void poll(); connect(); return () => { alive.current = false; if (pollTimer.current) clearTimeout(pollTimer.current); if (retryTimer.current) clearTimeout(retryTimer.current); if (toastTimer.current) clearTimeout(toastTimer.current); if (pendingTimer.current) clearTimeout(pendingTimer.current); if (pendingPollTimer.current) clearInterval(pendingPollTimer.current); wsRef.current?.close(); }; }, [connect, poll]);
+  useEffect(() => { alive.current = true; void poll(); connect(); return () => { alive.current = false; if (pollTimer.current) clearTimeout(pollTimer.current); if (retryTimer.current) clearTimeout(retryTimer.current); if (toastTimer.current) clearTimeout(toastTimer.current); if (pendingTimer.current) clearTimeout(pendingTimer.current); if (quickTimer.current) clearTimeout(quickTimer.current); if (pendingPollTimer.current) clearInterval(pendingPollTimer.current); if (quickPollTimer.current) clearInterval(quickPollTimer.current); wsRef.current?.close(); }; }, [connect, poll]);
   useEffect(() => {
     const count = state?.draft?.image_count ?? 0;
     if (!state?.config.mobile_auto_save_images || !state?.draft) {
@@ -241,6 +262,51 @@ function MobileApp() {
       notify("error", error instanceof DOMException && error.name === "AbortError" ? "桌面端请求超时，请检查局域网连接" : String(error));
     }
   };
+  const quickServerStatus = quickAttempt && state?.quick_request_id === quickAttempt.id ? state.quick_request_status ?? undefined : undefined;
+  useEffect(() => {
+    if (!quickAttempt) return;
+    if (quickServerStatus === "succeeded" || quickServerStatus === "failed") {
+      if (quickTimer.current) clearTimeout(quickTimer.current);
+      setQuickAttempt(current => current?.id === quickAttempt.id ? { ...current, stage: quickServerStatus } : current);
+      return;
+    }
+    if (quickServerStatus === "capturing" || quickServerStatus === "solving") {
+      setQuickAttempt(current => current?.id === quickAttempt.id && current.stage !== "accepted" ? { ...current, stage: "accepted" } : current);
+    } else if (quickAttempt.stage !== "sending" && quickAttempt.stage !== "accepted") {
+      return;
+    }
+    void poll();
+    if (quickPollTimer.current) clearInterval(quickPollTimer.current);
+    quickPollTimer.current = window.setInterval(() => { void poll(); }, 800);
+    return () => { if (quickPollTimer.current) clearInterval(quickPollTimer.current); };
+  }, [quickAttempt?.id, quickAttempt?.stage, quickServerStatus, poll]);
+  const quickSolve = async () => {
+    if (!state || connection !== "connected") { connect(); void poll(); return; }
+    if (quickAttempt && (quickAttempt.stage === "sending" || quickAttempt.stage === "accepted")) return;
+    const id = globalThis.crypto?.randomUUID
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setQuickAttempt({ id, stage: "sending" });
+    if (quickTimer.current) clearTimeout(quickTimer.current);
+    quickTimer.current = window.setTimeout(() => setQuickAttempt(current => current?.id === id ? { ...current, stage: "failed" } : current), 30000);
+    try {
+      const session = await ensureCryptoSession();
+      const payload = await encryptPayload(session, { id });
+      const controller = new AbortController();
+      const requestTimer = window.setTimeout(() => controller.abort(), 8000);
+      let response: Response;
+      try {
+        response = await fetch("/api/quick-solve", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json", "X-Baobao-Session": session.id }, body: payload, signal: controller.signal });
+      } finally { clearTimeout(requestTimer); }
+      const result = await decryptPayload<{ accepted?: boolean; error?: string }>(session, response);
+      if (!response.ok || result.accepted !== true) throw new Error(result.error || `请求失败（HTTP ${response.status}）`);
+      setQuickAttempt(current => current?.id === id ? { ...current, stage: "accepted" } : current);
+      void poll();
+    } catch {
+      if (quickTimer.current) clearTimeout(quickTimer.current);
+      setQuickAttempt(current => current?.id === id ? { ...current, stage: "failed" } : current);
+    }
+  };
   const imageCount = state?.draft?.image_count ?? 0;
   const interactiveThread = state?.interactive_thread_id;
   const busy = Boolean(pending) || state?.status === "capturing" || state?.status === "solving";
@@ -251,6 +317,22 @@ function MobileApp() {
   const conversationHint = state?.config.provider === "openai-api"
     ? "OpenAI API 连续模式会在本机维护本次运行的聊天记录。"
     : "Codex 连续模式会复用同一个会话。";
+
+  if (!state || state.config.simple_mode_enabled) {
+    const serverBusy = state?.quick_request_status === "capturing" || state?.quick_request_status === "solving";
+    const attemptBusy = quickAttempt?.stage === "sending" || quickAttempt?.stage === "accepted";
+    const completed = state?.quick_request_status === "succeeded" || quickAttempt?.stage === "succeeded";
+    const failed = state?.quick_request_status === "failed" || quickAttempt?.stage === "failed";
+    const label = !state
+      ? connection === "reconnecting" ? "连接中断，点击重连" : "正在连接电脑…"
+      : connection !== "connected"
+        ? connection === "connecting" ? "正在连接电脑…" : "连接中断，点击重连"
+      : serverBusy || attemptBusy || state.status === "capturing" || state.status === "solving" ? "处理中…"
+      : completed ? "完成 · 点击再答一题"
+      : failed ? "失败 · 点击重试"
+      : "点击开始答题";
+    return <main className="quick-mode-shell"><button className={`quick-mode-button${serverBusy || attemptBusy ? " is-processing" : failed ? " is-failed" : completed ? " is-complete" : ""}`} type="button" onClick={() => void quickSolve()} disabled={serverBusy || attemptBusy} aria-label={label}>{label}</button></main>;
+  }
 
   return <div className="mobile-shell">
     <header className="mobile-header">
