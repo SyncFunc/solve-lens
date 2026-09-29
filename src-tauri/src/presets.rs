@@ -26,6 +26,14 @@ pub fn built_in_presets() -> Vec<PromptPreset> {
             task_template: "识别代码语言和题目要求，定位问题或给出实现方案。答案需包含可执行的关键代码与简洁说明。".into(),
             version: 1,
         },
+        PromptPreset {
+            id: "discussion".into(),
+            name: "探讨题".into(),
+            built_in: true,
+            hotkey: String::new(),
+            task_template: "识别图片中的探讨论题，先判断题目分别对应的正方和反方立场，再按照正方、反方、正反结合三个方向分别生成内容。每个方向都要给出可行的论点、论据或案例方向，以及约 30 秒和约 1 分钟的发言稿；不要生成其他内容。表达要直白、清楚、像正常人在群面中说话，避免拗口、过度书面、官方或文学化的表达。论据优先使用可解释的逻辑和常识性场景；没有可靠依据时标记为案例方向，不要编造数据、调查结果、专家观点或具体事件细节。".into(),
+            version: 1,
+        },
     ]
 }
 
@@ -75,5 +83,22 @@ mod tests {
         assert!(prompt.contains("仅分析随请求提供的题图"));
         assert!(prompt.contains("数学"));
         assert!(prompt.contains("图片数量：2"));
+    }
+
+    #[test]
+    fn discussion_prompt_requires_balanced_arguments_without_fabricated_evidence() {
+        let preset = built_in_presets()
+            .into_iter()
+            .find(|item| item.id == "discussion")
+            .unwrap();
+        let prompt = build_prompt(&preset, 1);
+        assert!(prompt.contains("正方和反方"));
+        assert!(prompt.contains("正方、反方、正反结合三个方向"));
+        assert!(prompt.contains("论点、论据或案例方向"));
+        assert!(prompt.contains("不要生成核心争议比较维度"));
+        assert!(prompt.contains("不要生成可能的反驳和回应"));
+        assert!(prompt.contains("像正常人在群面中说话"));
+        assert!(prompt.contains("不要编造数据"));
+        assert!(prompt.contains("约 30 秒和约 1 分钟的发言稿"));
     }
 }

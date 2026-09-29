@@ -313,7 +313,7 @@ function MobileApp() {
   const autoSubmit = state?.config.auto_submit_after_capture ?? false;
   const continuous = state?.config.conversation_mode === "continuous";
   const presetName = state?.presets?.find(item => item.id === preset)?.name
-    ?? (preset === "math" ? "数学" : preset === "code" ? "代码" : "通用");
+    ?? (preset === "math" ? "数学" : preset === "code" ? "代码" : preset === "discussion" ? "探讨题" : "通用");
   const conversationHint = state?.config.provider === "openai-api"
     ? "OpenAI API 连续模式会在本机维护本次运行的聊天记录。"
     : "Codex 连续模式会复用同一个会话。";
@@ -349,7 +349,7 @@ function MobileApp() {
         </Space>
       </Card>
       <Card className="mobile-card mobile-preset-card" bordered={false}>
-        <div className="mobile-preset"><Text type="secondary">截图题型</Text><Select value={preset} onChange={setPreset} size="large"><Select.Option value="general">通用</Select.Option><Select.Option value="math">数学</Select.Option><Select.Option value="code">代码</Select.Option></Select></div>
+        <div className="mobile-preset"><Text type="secondary">截图题型</Text><Select value={preset} onChange={setPreset} size="large"><Select.Option value="general">通用</Select.Option><Select.Option value="math">数学</Select.Option><Select.Option value="code">代码</Select.Option><Select.Option value="discussion">探讨题</Select.Option></Select></div>
       </Card>
       <Card className="mobile-card mobile-settings-card" bordered={false}>
         <div className="mobile-setting-line"><div><Text>截图后直接提交</Text><Text type="secondary">截图完成后立即开始解题</Text></div><Switch checked={autoSubmit} disabled={!state || busy || settingsUpdating} onChange={value => void updateAnswerSettings({ auto_submit_after_capture: value })} /></div>
