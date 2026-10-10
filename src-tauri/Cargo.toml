@@ -28,4 +28,4 @@ tauri-plugin-global-shortcut = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["process", "time"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }

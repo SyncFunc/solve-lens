@@ -34,8 +34,9 @@ use std::{
     path::PathBuf,
     process::Command,
     str::FromStr,
-    sync::{Arc, Mutex},
-    time::UNIX_EPOCH,
+    sync::{mpsc, Arc, Mutex},
+    thread,
+    time::{Duration, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -48,6 +49,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 #[derive(Default)]
 struct Inner {
     draft: Option<QuestionDraft>,
+    selected_preset_id: Option<String>,
     answer: Option<AnswerResult>,
     answer_preset_id: Option<String>,
     status: String,
@@ -127,6 +129,10 @@ struct AppConfig {
     conversation_mode: String,
     simple_mode_enabled: bool,
     simple_mode_previous_provider: Option<String>,
+    overlay_interactive_mode: bool,
+    overlay_mouse_passthrough: bool,
+    overlay_mouse_restrict_to_overlay: bool,
+    overlay_minimal_mode: bool,
     openai_base_url: String,
     openai_api_key: String,
     openai_model: String,
@@ -159,6 +165,10 @@ impl Default for AppConfig {
             conversation_mode: "single".into(),
             simple_mode_enabled: false,
             simple_mode_previous_provider: None,
+            overlay_interactive_mode: false,
+            overlay_mouse_passthrough: true,
+            overlay_mouse_restrict_to_overlay: false,
+            overlay_minimal_mode: false,
             openai_base_url: "https://api.deepseek.com".into(),
             openai_api_key: String::new(),
             openai_model: "deepseek-flash".into(),
@@ -187,6 +197,7 @@ pub(crate) struct AppState {
     presets_path: PathBuf,
     config: Mutex<AppConfig>,
     config_path: PathBuf,
+    overlay_position_tx: mpsc::Sender<PhysicalPosition<i32>>,
     interactive_session_path: PathBuf,
     work_dir: PathBuf,
     history: HistoryStore,
@@ -198,6 +209,7 @@ pub(crate) struct AppState {
 #[derive(Serialize, Clone)]
 struct Snapshot {
     draft: Option<DraftView>,
+    selected_preset_id: String,
     answer_preset_id: Option<String>,
     presets: Vec<PromptPreset>,
     status: String,
@@ -216,9 +228,93 @@ struct Snapshot {
     config: AppConfig,
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredOverlayPosition {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Clone, Copy)]
+struct PendingOverlayMouseAction {
+    start_x: i32,
+    start_y: i32,
+    drag_origin: Option<PhysicalPosition<i32>>,
+    moved: bool,
+}
+
+fn load_overlay_position(path: &PathBuf) -> Option<PhysicalPosition<i32>> {
+    let bytes = fs::read(path).ok()?;
+    let saved: StoredOverlayPosition = serde_json::from_slice(&bytes).ok()?;
+    Some(PhysicalPosition::new(saved.x, saved.y))
+}
+
+fn start_overlay_position_writer(
+    path: PathBuf,
+    receiver: mpsc::Receiver<PhysicalPosition<i32>>,
+) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name("overlay-position-writer".into())
+        .spawn(move || {
+            while let Ok(mut position) = receiver.recv() {
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(350)) {
+                        Ok(latest) => position = latest,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            persist_overlay_position(&path, position);
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            persist_overlay_position(&path, position);
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .map(|_| ())
+}
+
+fn persist_overlay_position(path: &PathBuf, position: PhysicalPosition<i32>) {
+    let saved = StoredOverlayPosition {
+        x: position.x,
+        y: position.y,
+    };
+    let result = serde_json::to_vec(&saved)
+        .map_err(|error| error.to_string())
+        .and_then(|content| fs::write(path, content).map_err(|error| error.to_string()));
+    if let Err(error) = result {
+        eprintln!("failed to persist overlay position: {error}");
+    }
+}
+
+fn overlay_position_is_visible(
+    window: &tauri::WebviewWindow,
+    position: PhysicalPosition<i32>,
+) -> bool {
+    let (Ok(window_size), Ok(monitors)) = (window.outer_size(), window.available_monitors()) else {
+        return false;
+    };
+    let left = i64::from(position.x);
+    let top = i64::from(position.y);
+    let right = left + i64::from(window_size.width);
+    let bottom = top + i64::from(window_size.height);
+    monitors.into_iter().any(|monitor| {
+        let monitor_position = monitor.position();
+        let monitor_size = monitor.size();
+        let monitor_left = i64::from(monitor_position.x);
+        let monitor_top = i64::from(monitor_position.y);
+        let monitor_right = monitor_left + i64::from(monitor_size.width);
+        let monitor_bottom = monitor_top + i64::from(monitor_size.height);
+        let overlap_width = right.min(monitor_right) - left.max(monitor_left);
+        let overlap_height = bottom.min(monitor_bottom) - top.max(monitor_top);
+        overlap_width >= 64 && overlap_height >= 64
+    })
+}
+
 impl AppState {
     pub(crate) fn snapshot(&self) -> Snapshot {
         let inner = self.inner.lock().expect("application state lock");
+        let presets = self.presets.lock().expect("preset lock").clone();
         let full_images = self
             .config
             .lock()
@@ -279,8 +375,16 @@ impl AppState {
         }
         Snapshot {
             draft: draft_view,
+            selected_preset_id: inner
+                .draft
+                .as_ref()
+                .map(|draft| draft.preset_id.clone())
+                .or_else(|| inner.selected_preset_id.clone())
+                .filter(|id| presets.iter().any(|preset| preset.id == *id))
+                .or_else(|| presets.first().map(|preset| preset.id.clone()))
+                .unwrap_or_else(|| "general".into()),
             answer_preset_id: inner.answer_preset_id.clone(),
-            presets: self.presets.lock().expect("preset lock").clone(),
+            presets,
             status: inner.status.clone(),
             answer: inner.answer.clone(),
             protected_overlay: inner.protected_overlay,
@@ -529,28 +633,30 @@ fn update_config_impl(
     if !(1024..=65535).contains(&config.lan_control_port) {
         return Err("本地控制端口必须在 1024 到 65535 之间".into());
     }
-    if previous_config.hotkeys != config.hotkeys {
+    if previous_config.hotkeys != config.hotkeys
+        || previous_config.overlay_interactive_mode != config.overlay_interactive_mode
+    {
         let values = [
-            &config.hotkeys.general,
-            &config.hotkeys.math,
-            &config.hotkeys.code,
-            &config.hotkeys.submit,
-            &config.hotkeys.clear,
-            &config.hotkeys.toggle,
-            &config.hotkeys.next,
-            &config.hotkeys.previous,
-            &config.hotkeys.opacity_up,
-            &config.hotkeys.opacity_down,
-            &config.hotkeys.font_up,
-            &config.hotkeys.font_down,
-            &config.hotkeys.move_left,
-            &config.hotkeys.move_right,
-            &config.hotkeys.move_up,
-            &config.hotkeys.move_down,
-            &config.hotkeys.port_check,
+            ("general", &config.hotkeys.general),
+            ("math", &config.hotkeys.math),
+            ("code", &config.hotkeys.code),
+            ("submit", &config.hotkeys.submit),
+            ("clear", &config.hotkeys.clear),
+            ("toggle", &config.hotkeys.toggle),
+            ("next", &config.hotkeys.next),
+            ("previous", &config.hotkeys.previous),
+            ("opacity_up", &config.hotkeys.opacity_up),
+            ("opacity_down", &config.hotkeys.opacity_down),
+            ("font_up", &config.hotkeys.font_up),
+            ("font_down", &config.hotkeys.font_down),
+            ("move_left", &config.hotkeys.move_left),
+            ("move_right", &config.hotkeys.move_right),
+            ("move_up", &config.hotkeys.move_up),
+            ("move_down", &config.hotkeys.move_down),
+            ("port_check", &config.hotkeys.port_check),
         ];
         let mut parsed = Vec::new();
-        for value in values {
+        for (_, value) in values {
             let shortcut =
                 Shortcut::from_str(value.trim()).map_err(|_| format!("快捷键格式无效：{value}"))?;
             if parsed.iter().any(|item: &Shortcut| item == &shortcut) {
@@ -559,11 +665,65 @@ fn update_config_impl(
             parsed.push(shortcut);
         }
     }
+    let previous_mouse_passthrough =
+        !previous_config.overlay_interactive_mode || previous_config.overlay_mouse_passthrough;
+    let mouse_passthrough = !config.overlay_interactive_mode || config.overlay_mouse_passthrough;
+    if previous_mouse_passthrough != mouse_passthrough {
+        let window = app
+            .get_webview_window("overlay")
+            .ok_or("overlay window is unavailable")?;
+        overlay::set_mouse_passthrough(&window, mouse_passthrough)
+            .map_err(|error| error.to_string())?;
+    }
     *state
         .config
         .lock()
         .map_err(|_| "config state unavailable")? = config.clone();
     persist_config(&state)?;
+    // Re-register shortcuts only when the shortcut map changed. Saving a
+    // provider/display field must not disturb an already valid registration.
+    if previous_config.hotkeys != config.hotkeys
+        || previous_config.overlay_interactive_mode != config.overlay_interactive_mode
+    {
+        let register_result = app
+            .global_shortcut()
+            .unregister_all()
+            .map_err(|error| error.to_string())
+            .and_then(|_| register_shortcuts(&app).map_err(|error| error.to_string()));
+        if let Err(error) = register_result {
+            *state
+                .config
+                .lock()
+                .map_err(|_| "config state unavailable")? = previous_config.clone();
+            let mut rollback_errors = Vec::new();
+            if let Err(rollback_error) = persist_config(state) {
+                rollback_errors.push(format!("配置回滚失败：{rollback_error}"));
+            }
+            if previous_mouse_passthrough != mouse_passthrough {
+                if let Some(window) = app.get_webview_window("overlay") {
+                    if let Err(rollback_error) =
+                        overlay::set_mouse_passthrough(&window, previous_mouse_passthrough)
+                    {
+                        rollback_errors.push(format!("鼠标透传回滚失败：{rollback_error}"));
+                    }
+                }
+            }
+            if let Err(rollback_error) = app
+                .global_shortcut()
+                .unregister_all()
+                .map_err(|error| error.to_string())
+                .and_then(|_| register_shortcuts(&app).map_err(|error| error.to_string()))
+            {
+                rollback_errors.push(format!("旧快捷键恢复失败：{rollback_error}"));
+            }
+            let details = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("；{}", rollback_errors.join("；"))
+            };
+            return Err(format!("快捷键注册失败：{error}{details}"));
+        }
+    }
     if previous_config.lan_control_enabled != config.lan_control_enabled
         || previous_config.lan_control_port != config.lan_control_port
     {
@@ -589,14 +749,6 @@ fn update_config_impl(
         } else {
             None
         };
-    }
-    // Re-register shortcuts only when the shortcut map changed. Saving a
-    // provider/display field must not disturb an already valid registration.
-    if previous_config.hotkeys != config.hotkeys {
-        app.global_shortcut()
-            .unregister_all()
-            .map_err(|error| error.to_string())?;
-        register_shortcuts(&app).map_err(|error| error.to_string())?;
     }
     if previous_config.overlay_width != config.overlay_width
         || previous_config.overlay_height != config.overlay_height
@@ -1099,18 +1251,94 @@ fn detect_local_ipv4() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn select_capture_preset(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    preset_id: String,
+) -> Result<(), String> {
+    select_capture_preset_impl(app, state.inner().clone(), preset_id)
+}
+
+fn select_capture_preset_impl(
+    app: AppHandle,
+    state: Arc<AppState>,
+    preset_id: String,
+) -> Result<(), String> {
+    state.preset(&preset_id)?;
+    let mut inner = state
+        .inner
+        .lock()
+        .map_err(|_| "application state unavailable")?;
+    if let Some(draft) = inner.draft.as_ref() {
+        if draft.preset_id != preset_id {
+            return Err("当前草稿已绑定其他题型，请先提交或清空".into());
+        }
+    }
+    if inner.selected_preset_id.as_deref() == Some(preset_id.as_str()) {
+        return Ok(());
+    }
+    inner.selected_preset_id = Some(preset_id);
+    drop(inner);
+    emit_snapshot(&app, &state);
+    Ok(())
+}
+
+#[tauri::command]
 fn capture_for_preset(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     preset_id: String,
 ) -> Result<(), String> {
+    capture_for_preset_inner(app, state.inner().clone(), preset_id)
+}
+
+#[tauri::command]
+fn capture_and_submit_overlay(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let (config, preset_id) = {
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| "config state unavailable")?
+            .clone();
+        let inner = state
+            .inner
+            .lock()
+            .map_err(|_| "application state unavailable")?;
+        if matches!(inner.status.as_str(), "capturing" | "solving") {
+            return Err("已有截图或答题任务正在处理中，请稍候".into());
+        }
+        let preset_id = inner
+            .draft
+            .as_ref()
+            .map(|draft| draft.preset_id.clone())
+            .or_else(|| inner.selected_preset_id.clone())
+            .unwrap_or_else(|| "general".into());
+        (config, preset_id)
+    };
+    if !config.overlay_interactive_mode {
+        return Err("互动浮窗模式未启用".into());
+    }
+    capture_for_preset_inner(app, state.inner().clone(), preset_id)
+}
+
+fn capture_for_preset_inner(
+    app: AppHandle,
+    state: Arc<AppState>,
+    preset_id: String,
+) -> Result<(), String> {
+    select_capture_preset_impl(app.clone(), state.clone(), preset_id.clone())?;
     let trace = TraceContext::new("capture");
     state.preset(&preset_id)?;
-    let auto_submit_after_capture = state
-        .config
-        .lock()
-        .map_err(|_| "config state unavailable")?
-        .auto_submit_after_capture;
+    let (auto_submit_after_capture, simple_mode_enabled) = {
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| "config state unavailable")?;
+        (config.auto_submit_after_capture, config.simple_mode_enabled)
+    };
     {
         let mut inner = state
             .inner
@@ -1133,17 +1361,20 @@ fn capture_for_preset(
         inner.status = "capturing".into();
         inner.trace_id = Some(trace.trace_id.clone());
         inner.message = Some(format!("正在后台截取主屏（traceId: {}）", trace.trace_id));
+        if simple_mode_enabled {
+            inner.quick_overlay_symbol = inner.protected_overlay.then(|| "~".into());
+        }
     }
     emit_snapshot(&app, &state);
     let work_dir = state.work_dir.clone();
-    let state = state.inner().clone();
+    let state_for_job = state.clone();
     let submit_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let span = trace.span("capture.primary_screen");
         let captured = capture::capture_primary(&work_dir);
         drop(span);
         let mut should_submit = false;
-        let mut inner = match state.inner.lock() {
+        let mut inner = match state_for_job.inner.lock() {
             Ok(value) => value,
             Err(_) => return,
         };
@@ -1162,6 +1393,9 @@ fn capture_for_preset(
                     let _ = fs::remove_file(image.path);
                     inner.status = "failed".into();
                     inner.message = Some(format!("截图失败：{error}"));
+                    if simple_mode_enabled {
+                        inner.quick_overlay_symbol = inner.protected_overlay.then(|| "*".into());
+                    }
                 } else {
                     inner.answer = None;
                     inner.answer_preset_id = None;
@@ -1169,6 +1403,9 @@ fn capture_for_preset(
                     inner.answer_page = 0;
                     inner.status = "drafting".into();
                     should_submit = auto_submit_after_capture;
+                    if simple_mode_enabled && !auto_submit_after_capture {
+                        inner.quick_overlay_symbol = None;
+                    }
                     inner.message = Some(if auto_submit_after_capture {
                         "截图已添加，正在自动提交".into()
                     } else {
@@ -1179,18 +1416,21 @@ fn capture_for_preset(
             Err(error) => {
                 inner.status = "failed".into();
                 inner.message = Some(format!("截图失败：{error}"));
+                if simple_mode_enabled {
+                    inner.quick_overlay_symbol = inner.protected_overlay.then(|| "*".into());
+                }
             }
         }
         drop(inner);
-        emit_snapshot(&app, &state);
+        emit_snapshot(&app, &state_for_job);
         if should_submit {
             let submit_state = submit_app.state::<Arc<AppState>>();
             if let Err(error) = submit_draft(submit_app.clone(), submit_state) {
-                if let Ok(mut inner) = state.inner.lock() {
+                if let Ok(mut inner) = state_for_job.inner.lock() {
                     inner.status = "drafting".into();
                     inner.message = Some(format!("截图成功，但自动提交失败：{error}"));
                 }
-                emit_snapshot(&submit_app, &state);
+                emit_snapshot(&submit_app, &state_for_job);
             }
         }
     });
@@ -1264,19 +1504,17 @@ fn clear_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), St
 
 #[tauri::command]
 fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let trace = TraceContext::new("submit");
-    let provider = state
+    let config = state
         .config
         .lock()
         .map_err(|_| "config state unavailable")?
-        .provider
         .clone();
+    if config.simple_mode_enabled {
+        return submit_simple_draft(app, state.inner().clone(), config);
+    }
+    let trace = TraceContext::new("submit");
+    let provider = config.provider.clone();
     if provider == "openai-api" {
-        let config = state
-            .config
-            .lock()
-            .map_err(|_| "config state unavailable")?
-            .clone();
         let (draft, preset, history) = {
             let mut inner = state
                 .inner
@@ -1554,6 +1792,105 @@ fn submit_draft(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
     Ok(())
 }
 
+fn submit_simple_draft(
+    app: AppHandle,
+    state: Arc<AppState>,
+    config: AppConfig,
+) -> Result<(), String> {
+    if config.provider != "openai-api" {
+        return Err("极简模式当前只支持 OpenAI API".into());
+    }
+    let trace = TraceContext::new("quick_solve");
+    let (draft, command_id) = {
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "application state unavailable")?;
+        if matches!(inner.status.as_str(), "capturing" | "solving") {
+            return Err("已有任务正在处理中".into());
+        }
+        if !inner.protected_overlay {
+            return Err("浮窗捕获保护未确认，拒绝显示答案".into());
+        }
+        let draft = inner.draft.clone().ok_or("请先添加至少一张截图")?;
+        let command_id = format!("simple-submit-{}", uuid::Uuid::new_v4());
+        inner.quick_request_id = Some(command_id.clone());
+        inner.quick_request_status = Some("solving".into());
+        inner.quick_overlay_symbol = Some("~".into());
+        inner.answer = None;
+        inner.answer_preset_id = None;
+        inner.status = "solving".into();
+        inner.trace_id = Some(trace.trace_id.clone());
+        inner.message = Some("极简模式正在识别选择题".into());
+        (draft, command_id)
+    };
+    emit_snapshot(&app, &state);
+
+    let provider = OpenAiProvider {
+        base_url: config.openai_base_url,
+        api_key: config.openai_api_key,
+        model: config.openai_model,
+        reasoning_effort: config.openai_reasoning_effort,
+        timeout_seconds: config.codex_timeout_seconds,
+        prompt_addendum: String::new(),
+    };
+    let app_for_job = app.clone();
+    let state_for_job = state.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let span = trace.span("quick_solve.openai_tool");
+        let result = provider.solve_choice(&draft, &trace);
+        drop(span);
+
+        let mut inner = match state_for_job.inner.lock() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if inner.quick_request_id.as_deref() != Some(command_id.as_str()) {
+            return;
+        }
+        match result {
+            Ok(ChoiceToolResult::Choice(choice)) => match choice_dots(choice) {
+                Ok(dots) => {
+                    remove_draft_images(&draft);
+                    inner.draft = None;
+                    inner.quick_overlay_symbol = Some(dots);
+                    inner.quick_request_status = Some("succeeded".into());
+                    inner.status = "displaying".into();
+                    inner.message = Some("极简答案已生成".into());
+                }
+                Err(error) => {
+                    inner.quick_overlay_symbol = Some("*".into());
+                    inner.quick_request_status = Some("failed".into());
+                    inner.status = "failed".into();
+                    inner.message = Some(error.to_string());
+                }
+            },
+            Ok(ChoiceToolResult::Unreadable(reason)) => {
+                inner.quick_overlay_symbol = Some("*".into());
+                inner.quick_request_status = Some("failed".into());
+                inner.status = "failed".into();
+                inner.message = Some(format!("无法识别选择题：{reason}"));
+            }
+            Err(error) => {
+                trace.error(&error.to_string());
+                inner.quick_overlay_symbol = Some("*".into());
+                inner.quick_request_status = Some("failed".into());
+                inner.status = "failed".into();
+                inner.message = Some(format!("极简答题失败：{error}"));
+            }
+        }
+        let can_show = inner.protected_overlay && !inner.overlay_user_hidden;
+        drop(inner);
+        if can_show {
+            if let Some(window) = app_for_job.get_webview_window("overlay") {
+                let _ = overlay::show(&window);
+            }
+        }
+        emit_snapshot(&app_for_job, &state_for_job);
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn cancel_current_job(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let (pid, interactive) = {
@@ -1595,9 +1932,7 @@ fn toggle_overlay(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(),
         .inner
         .lock()
         .map_err(|_| "application state unavailable")?;
-    if !inner.protected_overlay {
-        return Err("浮窗保护未确认，拒绝显示答案".into());
-    }
+    let protected = inner.protected_overlay;
     drop(inner);
     let window = app
         .get_webview_window("overlay")
@@ -1606,10 +1941,28 @@ fn toggle_overlay(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(),
     if visible {
         overlay::hide(&window).map_err(|error| error.to_string())?;
     } else {
+        if !protected {
+            return Err("浮窗保护未确认，拒绝显示答案".into());
+        }
         overlay::show(&window).map_err(|error| error.to_string())?;
     }
     if let Ok(mut inner) = state.inner.lock() {
         inner.overlay_user_hidden = visible;
+    }
+    emit_snapshot(&app, &state);
+    Ok(())
+}
+
+#[tauri::command]
+fn hide_overlay(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let window = app
+        .get_webview_window("overlay")
+        .ok_or("overlay window is unavailable")?;
+    if window.is_visible().map_err(|error| error.to_string())? {
+        overlay::hide(&window).map_err(|error| error.to_string())?;
+    }
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.overlay_user_hidden = true;
     }
     emit_snapshot(&app, &state);
     Ok(())
@@ -1754,7 +2107,9 @@ fn register_shortcuts(app: &AppHandle) -> tauri::Result<()> {
         .lock()
         .expect("preset lock")
         .iter()
-        .filter(|preset| !preset.built_in && preset.hotkey != "未设置")
+        .filter(|preset| {
+            !preset.built_in && preset.hotkey != "未设置"
+        })
         .filter_map(|preset| {
             Shortcut::from_str(&preset.hotkey)
                 .ok()
@@ -1762,9 +2117,6 @@ fn register_shortcuts(app: &AppHandle) -> tauri::Result<()> {
         })
         .collect();
     let mut shortcuts = vec![
-        general.clone(),
-        math.clone(),
-        code.clone(),
         submit.clone(),
         clear.clone(),
         toggle.clone(),
@@ -1772,13 +2124,12 @@ fn register_shortcuts(app: &AppHandle) -> tauri::Result<()> {
         opacity_down.clone(),
         font_up.clone(),
         font_down.clone(),
-        next.clone(),
-        previous.clone(),
         move_left.clone(),
         move_right.clone(),
         move_up.clone(),
         move_down.clone(),
     ];
+    shortcuts.extend([general.clone(), math.clone(), code.clone(), next.clone(), previous.clone()]);
     shortcuts.extend(
         custom_shortcuts
             .iter()
@@ -1790,7 +2141,7 @@ fn register_shortcuts(app: &AppHandle) -> tauri::Result<()> {
                 return;
             }
             let state = app.state::<Arc<AppState>>();
-            let _ = match shortcut {
+            let result = match shortcut {
                 item if *item == general => {
                     capture_for_preset(app.clone(), state, "general".into())
                 }
@@ -1815,6 +2166,13 @@ fn register_shortcuts(app: &AppHandle) -> tauri::Result<()> {
                     .map(|(_, preset_id)| capture_for_preset(app.clone(), state, preset_id.clone()))
                     .unwrap_or(Ok(())),
             };
+            if let Err(error) = result {
+                let state = app.state::<Arc<AppState>>();
+                if let Ok(mut inner) = state.inner().inner.lock() {
+                    inner.message = Some(format!("快捷键操作失败：{error}"));
+                }
+                emit_snapshot(app, state.inner());
+            }
         })
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok(())
@@ -1873,18 +2231,29 @@ fn main() {
                 }
             };
             let config_path = data_dir.join("config.json");
+            let overlay_position_path = data_dir.join("overlay-position.json");
+            let saved_overlay_position = load_overlay_position(&overlay_position_path);
+            let (overlay_position_tx, overlay_position_rx) = mpsc::channel();
+            start_overlay_position_writer(overlay_position_path, overlay_position_rx)?;
             let interactive_session_path = data_dir.join("interactive-session.json");
             let interactive_thread_id = load_interactive_thread(&interactive_session_path);
+            let presets = load_presets(&data_dir.join("presets.json"));
+            let selected_preset_id = presets
+                .first()
+                .map(|preset| preset.id.clone())
+                .or_else(|| Some("general".into()));
             let state = Arc::new(AppState {
                 inner: Mutex::new(Inner {
                     status: "idle".into(),
+                    selected_preset_id,
                     interactive_thread_id,
                     ..Default::default()
                 }),
-                presets: Mutex::new(load_presets(&data_dir.join("presets.json"))),
+                presets: Mutex::new(presets),
                 presets_path: data_dir.join("presets.json"),
                 config: Mutex::new(load_config(&config_path)),
                 config_path,
+                overlay_position_tx,
                 interactive_session_path,
                 work_dir,
                 history,
@@ -1915,7 +2284,13 @@ fn main() {
                     _ => {}
                 })
                 .build(app)?;
-            let protected = overlay::secure_overlay(&overlay_window).is_ok();
+            let initial_overlay_config = state.config.lock().expect("config lock").clone();
+            let protected = overlay::secure_overlay(
+                &overlay_window,
+                !initial_overlay_config.overlay_interactive_mode
+                    || initial_overlay_config.overlay_mouse_passthrough,
+            )
+            .is_ok();
             state
                 .inner
                 .lock()
@@ -1956,6 +2331,117 @@ fn main() {
                 );
             }); // LAN commands are dispatched directly by LocalServer into the same business functions.
             let app_state = app.state::<Arc<AppState>>();
+            let shortcut_app = app.handle().clone();
+            let shortcut_window = overlay_window.clone();
+            let pending_mouse_action = Arc::new(Mutex::new(None::<PendingOverlayMouseAction>));
+            let callback_mouse_action = Arc::clone(&pending_mouse_action);
+            if let Err(error) =
+                overlay::start_mouse_shortcut_listener(&overlay_window, move |event| {
+                    let app_state = shortcut_app.state::<Arc<AppState>>().inner().clone();
+                    let config = match app_state.config.lock() {
+                        Ok(config) => config.clone(),
+                        Err(_) => return,
+                    };
+                    if !config.overlay_interactive_mode {
+                        if let Ok(mut pending) = callback_mouse_action.lock() {
+                            *pending = None;
+                        }
+                        return;
+                    }
+                    let (x, y) = match event {
+                        overlay::MouseShortcutEvent::LeftDown { x, y }
+                        | overlay::MouseShortcutEvent::LeftUp { x, y }
+                        | overlay::MouseShortcutEvent::MouseMove { x, y }
+                        | overlay::MouseShortcutEvent::RightClick { x, y }
+                        | overlay::MouseShortcutEvent::Wheel { x, y, .. } => (x, y),
+                    };
+                    let overlay_position = shortcut_window.outer_position().ok();
+                    let inside_overlay = overlay_position
+                        .zip(shortcut_window.outer_size().ok())
+                        .map(|(position, size)| {
+                            let x = i64::from(x);
+                            let y = i64::from(y);
+                            let left = i64::from(position.x);
+                            let top = i64::from(position.y);
+                            x >= left
+                                && y >= top
+                                && x < left + i64::from(size.width)
+                                && y < top + i64::from(size.height)
+                        })
+                        .unwrap_or(false);
+                    let within_trigger_range =
+                        !config.overlay_mouse_restrict_to_overlay || inside_overlay;
+                    match event {
+                        overlay::MouseShortcutEvent::LeftDown { .. } => {
+                            if let Ok(mut pending) = callback_mouse_action.lock() {
+                                *pending = None;
+                                if within_trigger_range {
+                                    *pending = Some(PendingOverlayMouseAction {
+                                        start_x: x,
+                                        start_y: y,
+                                        drag_origin: if inside_overlay {
+                                            overlay_position
+                                        } else {
+                                            None
+                                        },
+                                        moved: false,
+                                    });
+                                }
+                            }
+                        }
+                        overlay::MouseShortcutEvent::MouseMove { .. } => {
+                            let Ok(mut pending) = callback_mouse_action.lock() else {
+                                return;
+                            };
+                            let Some(action) = pending.as_mut() else {
+                                return;
+                            };
+                            let dx = i64::from(x) - i64::from(action.start_x);
+                            let dy = i64::from(y) - i64::from(action.start_y);
+                            if !action.moved
+                                && dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) >= 36
+                            {
+                                action.moved = true;
+                            }
+                            if action.moved {
+                                if let Some(origin) = action.drag_origin {
+                                    let position = PhysicalPosition::new(
+                                        origin.x.saturating_add(x.saturating_sub(action.start_x)),
+                                        origin.y.saturating_add(y.saturating_sub(action.start_y)),
+                                    );
+                                    let _ =
+                                        shortcut_window.set_position(Position::Physical(position));
+                                }
+                            }
+                        }
+                        overlay::MouseShortcutEvent::LeftUp { .. } => {
+                            let action = callback_mouse_action
+                                .lock()
+                                .ok()
+                                .and_then(|mut pending| pending.take());
+                            if action.is_some_and(|action| !action.moved) {
+                                let _ = shortcut_app.emit("overlay-mouse-left", ());
+                            }
+                        }
+                        overlay::MouseShortcutEvent::RightClick { .. } => {
+                            if !within_trigger_range {
+                                return;
+                            }
+                            let _ = shortcut_app.emit("overlay-mouse-right", ());
+                        }
+                        overlay::MouseShortcutEvent::Wheel { delta, .. } => {
+                            if !within_trigger_range {
+                                return;
+                            }
+                            let _ = shortcut_app
+                                .emit("overlay-scroll", serde_json::json!({"wheel_delta": delta}));
+                        }
+                    }
+                })
+            {
+                let mut inner = app_state.inner.lock().expect("application state lock");
+                inner.message = Some(format!("浮窗鼠标快捷操作初始化失败：{error}"));
+            }
             let initial_config = app_state.config.lock().expect("config lock").clone();
             if initial_config.lan_control_enabled {
                 if let Ok(server) = local_server::LocalServer::start(
@@ -1976,6 +2462,11 @@ fn main() {
                 config.overlay_width,
                 config.overlay_height,
             )));
+            if let Some(position) = saved_overlay_position {
+                if overlay_position_is_visible(&overlay_window, position) {
+                    let _ = overlay_window.set_position(Position::Physical(position));
+                }
+            }
             if protected {
                 let _ = overlay::show(&overlay_window);
             } else {
@@ -1991,6 +2482,13 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == "overlay" {
+                if let WindowEvent::Moved(position) = event {
+                    if let Some(state) = window.app_handle().try_state::<Arc<AppState>>() {
+                        let _ = state.overlay_position_tx.send(*position);
+                    }
+                }
+            }
             if window.label() == "main" {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
@@ -2001,11 +2499,14 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             detect_local_ipv4,
+            select_capture_preset,
             capture_for_preset,
+            capture_and_submit_overlay,
             clear_draft,
             submit_draft,
             cancel_current_job,
             toggle_overlay,
+            hide_overlay,
             copy_preset,
             update_custom_preset,
             update_config,

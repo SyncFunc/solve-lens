@@ -23,6 +23,10 @@ const fallbackConfig: Config = {
   conversation_mode: "single",
   simple_mode_enabled: false,
   simple_mode_previous_provider: null,
+  overlay_interactive_mode: false,
+  overlay_mouse_passthrough: true,
+  overlay_mouse_restrict_to_overlay: false,
+  overlay_minimal_mode: false,
   openai_base_url: "https://api.deepseek.com",
   openai_api_key: "",
   openai_model: "deepseek-flash",
@@ -44,6 +48,7 @@ const fallbackConfig: Config = {
 };
 
 const fallbackSnapshot: Snapshot = {
+  selected_preset_id: "general",
   presets: [],
   answer_page: 0,
   has_openai_history: false,
@@ -58,6 +63,7 @@ type ContextValue = UiState & {
   refresh: () => Promise<void>;
   command: (kind: PendingCommand["kind"], name: string, args?: Record<string, unknown>) => Promise<void>;
   updateConfig: (config: Config) => Promise<void>;
+  updateConfigPatch: (patch: Record<string, unknown>) => Promise<void>;
   notify: (level: ToastLevel, text: string) => void;
   clearPending: () => void;
 };
@@ -77,6 +83,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [pending, setPending] = useState<PendingCommand | undefined>(undefined);
   const [toast, setToast] = useState<UiState["toast"] | undefined>(undefined);
   const toastTimer = useRef<number | undefined>(undefined);
+  const configWriteQueue = useRef<Promise<void>>(Promise.resolve());
 
   const notify = useCallback((level: ToastLevel, text: string) => {
     setToast({ level, text });
@@ -132,7 +139,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const baseline = snapshot.config;
     const patch: Record<string, unknown> = {};
     const scalarFields: (keyof Config)[] = [
-      "provider", "codex_path", "codex_execution_mode", "auto_submit_after_capture", "conversation_mode", "simple_mode_enabled", "openai_base_url", "openai_api_key", "openai_model", "openai_reasoning_effort", "overlay_opacity", "overlay_theme", "overlay_font_size",
+      "provider", "codex_path", "codex_execution_mode", "auto_submit_after_capture", "conversation_mode", "simple_mode_enabled", "openai_base_url", "openai_api_key", "openai_model", "openai_reasoning_effort", "overlay_opacity", "overlay_theme", "overlay_font_size", "overlay_interactive_mode", "overlay_mouse_passthrough", "overlay_mouse_restrict_to_overlay", "overlay_minimal_mode",
       "overlay_width", "overlay_height", "codex_timeout_seconds", "codex_model", "codex_reasoning_effort", "codex_service_tier",
       "prompt_addendum", "lan_control_enabled", "lan_control_port", "mobile_auto_save_images",
     ];
@@ -143,7 +150,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (Object.keys(hotkeys).length) patch.hotkeys = hotkeys;
     if (!Object.keys(patch).length) { notify("info", "没有需要保存的修改"); return; }
     try {
-      await invoke("update_config", { config: patch });
+      const write = configWriteQueue.current.then(() => invoke<void>("update_config", { config: patch }));
+      configWriteQueue.current = write.then(() => undefined, () => undefined);
+      await write;
       notify("success", "配置已保存");
       await refresh();
     } catch (error) {
@@ -151,6 +160,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       throw error;
     }
   }, [notify, refresh, snapshot.config]);
+
+  const updateConfigPatch = useCallback(async (patch: Record<string, unknown>) => {
+    if (!Object.keys(patch).length) return;
+    try {
+      const write = configWriteQueue.current.then(() => invoke<void>("update_config", { config: patch }));
+      configWriteQueue.current = write.then(() => undefined, () => undefined);
+      await write;
+      await refresh();
+    } catch (error) {
+      notify("error", String(error));
+      throw error;
+    }
+  }, [notify, refresh]);
 
   useEffect(() => {
     if (!pending) return;
@@ -173,7 +195,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, [pending, snapshot, notify]);
 
-  const value = useMemo(() => ({ snapshot, pending, toast, refresh, command, updateConfig, notify, clearPending: () => setPending(undefined) }), [snapshot, pending, toast, refresh, command, updateConfig, notify]);
+  const value = useMemo(() => ({ snapshot, pending, toast, refresh, command, updateConfig, updateConfigPatch, notify, clearPending: () => setPending(undefined) }), [snapshot, pending, toast, refresh, command, updateConfig, updateConfigPatch, notify]);
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
 

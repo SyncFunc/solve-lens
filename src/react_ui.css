@@ -97,7 +97,9 @@ body, button, input, textarea, select { font-family: inherit; }
 .lan-address-panel .arco-typography-secondary { color: var(--bb-muted) !important; font-size: 12px; line-height: 1.45; }
 .current-value { margin-top: 14px; gap: 7px; }
 .hotkey-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 16px; }
+.hotkey-label { display: flex; align-items: center; gap: 7px; min-height: 22px; flex-wrap: wrap; }
 .hotkey-hint { margin: 13px 0; color: var(--bb-muted); font-size: 12px; }
+.hotkey-mouse-options { margin: 8px 0 2px; }
 .field-error { margin-top: 4px; color: var(--bb-danger); font-size: 12px; }
 .shortcut-field { display: flex; flex-direction: column; }
 .preset-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--bb-border); }
@@ -134,10 +136,13 @@ body, button, input, textarea, select { font-family: inherit; }
 .toast-icon { display: inline-flex; }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
 
-/* Overlay must remain a truly transparent, non-interactive surface. */
+/* The overlay stays transparent and click-through; an optional native mouse hook handles shortcuts. */
 .overlay-window, .overlay-window body, .overlay-window #app { background: transparent !important; background-image: none !important; }
 .overlay-root { width: 100vw; height: 100vh; overflow: hidden; pointer-events: none; background: transparent; }
 .overlay-root.simple-overlay { display: flex; align-items: center; justify-content: center; background: transparent; }
+.overlay-root.minimal-overlay { display: flex; align-items: center; justify-content: center; background: transparent; }
+.minimal-overlay-content { box-sizing: border-box; max-width: 100%; max-height: 100%; padding: 4px 6px; overflow-x: hidden; overflow-y: auto; background: transparent; text-align: center; white-space: pre-wrap; word-break: break-word; line-height: 1.45; scrollbar-width: none; }
+.minimal-overlay-content::-webkit-scrollbar { width: 0; height: 0; }
 .simple-overlay-symbol { max-width: 100%; overflow: hidden; background: transparent; font-family: Consolas, "Cascadia Mono", monospace; font-weight: 700; line-height: 1; letter-spacing: .06em; white-space: nowrap; }
 .overlay-content { box-sizing: border-box; display: inline-block; max-width: 100%; max-height: 100%; padding: 15px 18px; overflow: hidden; color: #f7fbff; pointer-events: none; }
 .overlay-meta { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; color: rgba(255, 255, 255, .74); font-size: .7em; }

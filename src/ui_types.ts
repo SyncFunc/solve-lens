@@ -44,6 +44,10 @@ export type Config = {
   conversation_mode: "single" | "continuous";
   simple_mode_enabled: boolean;
   simple_mode_previous_provider: string | null;
+  overlay_interactive_mode: boolean;
+  overlay_mouse_passthrough: boolean;
+  overlay_mouse_restrict_to_overlay: boolean;
+  overlay_minimal_mode: boolean;
   openai_base_url: string;
   openai_api_key: string;
   openai_model: string;
@@ -73,6 +77,7 @@ export type Draft = {
 
 export type Snapshot = {
   trace_id?: string;
+  selected_preset_id: string;
   quick_overlay_symbol?: string | null;
   quick_request_id?: string | null;
   quick_request_status?: string | null;

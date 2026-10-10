@@ -32,7 +32,7 @@ function ActionButton({ children, danger, ...props }: React.ComponentProps<typeo
   return <ArcoButton {...props} type={props.type ?? "secondary"} status={danger ? "danger" : props.status} className={`${props.className ?? ""} pressable`.trim()}>{children}</ArcoButton>;
 }
 
-export function ShortcutInput({ value, onChange, error }: { value: string; onChange: (value: string) => void; error?: string }) {
+export function ShortcutInput({ value, onChange, error, disabled = false }: { value: string; onChange: (value: string) => void; error?: string; disabled?: boolean }) {
   const [focused, setFocused] = useState(false);
   const keyName = (event: React.KeyboardEvent<HTMLInputElement>) => {
     const mods: string[] = [];
@@ -54,7 +54,7 @@ export function ShortcutInput({ value, onChange, error }: { value: string; onCha
     onChange([...mods, key].join("+"));
   };
   return <div className="shortcut-field">
-    <Input value={value} readOnly status={error ? "error" : undefined} aria-invalid={Boolean(error)} onFocus={() => setFocused(true)} onBlur={() => setFocused(false)} onKeyDown={keyName} placeholder={focused ? "按下组合键…" : "点击后按下快捷键"} suffix={focused ? <IconLoading /> : undefined} />
+    <Input value={value} readOnly disabled={disabled} status={error ? "error" : undefined} aria-invalid={Boolean(error)} onFocus={() => setFocused(true)} onBlur={() => setFocused(false)} onKeyDown={keyName} placeholder={focused ? "按下组合键…" : "点击后按下快捷键"} suffix={focused ? <IconLoading /> : undefined} />
     {error && <div className="field-error">{error}</div>}
   </div>;
 }
@@ -65,13 +65,21 @@ function ThumbGrid({ draft }: { draft?: Snapshot["draft"] }) {
 }
 
 export function TaskPanel({ snapshot, pending, onCommand }: { snapshot: Snapshot; pending?: PendingCommand; onCommand: (kind: PendingCommand["kind"], name: string, args?: Record<string, unknown>) => Promise<void> }) {
-  const [selected, setSelected] = useState(snapshot.draft?.preset_id ?? snapshot.presets[0]?.id ?? "general");
-  useEffect(() => { if (snapshot.draft?.preset_id) setSelected(snapshot.draft.preset_id); }, [snapshot.draft?.preset_id]);
+  const { notify } = useAppState();
+  const [selected, setSelected] = useState(snapshot.draft?.preset_id ?? snapshot.selected_preset_id ?? snapshot.presets[0]?.id ?? "general");
+  useEffect(() => { setSelected(snapshot.draft?.preset_id ?? snapshot.selected_preset_id); }, [snapshot.draft?.preset_id, snapshot.selected_preset_id]);
+  const selectPreset = (presetId: string) => {
+    setSelected(presetId);
+    void invoke("select_capture_preset", { presetId }).catch(error => {
+      setSelected(snapshot.draft?.preset_id ?? snapshot.selected_preset_id);
+      notify("error", String(error));
+    });
+  };
   const presets = snapshot.presets.length ? snapshot.presets : [{ id: "general", name: "通用", built_in: true, hotkey: "", task_template: "", version: 1 }];
   const busy = Boolean(pending) || snapshot.status === "capturing" || snapshot.status === "solving";
   return <Card className="panel-card task-card" title={<span><IconPlayArrow /> 题目工作台</span>} extra={<Tag color={snapshot.status === "idle" ? "gray" : "arcoblue"}>{snapshot.status || "idle"}</Tag>}>
     <Space direction="vertical" size={16}>
-      <div className="task-toolbar"><Select value={selected} onChange={setSelected} className="preset-select" placeholder="选择题型">{presets.map(p => <Select.Option key={p.id} value={p.id}>{p.name}</Select.Option>)}</Select><Text type="secondary">快捷键截图可连续加入同一草稿，最多 6 张</Text></div>
+      <div className="task-toolbar"><Select value={selected} onChange={selectPreset} disabled={Boolean(snapshot.draft?.image_count)} className="preset-select" placeholder="选择题型">{presets.map(p => <Select.Option key={p.id} value={p.id}>{p.name}</Select.Option>)}</Select><Text type="secondary">快捷键截图可连续加入同一草稿，最多 6 张</Text></div>
       <ThumbGrid draft={snapshot.draft} />
       <div className="task-actions">
         <ActionButton type="primary" loading={pending?.kind === "capture"} disabled={busy} onClick={() => onCommand("capture", "capture_for_preset", { presetId: selected })}><IconUpload /> 截图加入</ActionButton>
@@ -85,7 +93,7 @@ export function TaskPanel({ snapshot, pending, onCommand }: { snapshot: Snapshot
   </Card>;
 }
 
-export function ProviderCard({ config, setConfig, threadId }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; threadId?: string }) {
+export function ProviderCard({ config, setConfig, setConfigImmediately, updateConfigPatch, threadId }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; setConfigImmediately: React.Dispatch<React.SetStateAction<Config>>; updateConfigPatch: (patch: Record<string, unknown>) => Promise<void>; threadId?: string }) {
   const { snapshot } = useAppState();
   const [models, setModels] = useState<CodexModelOption[]>([]);
   const [loading, setLoading] = useState(false);
@@ -140,13 +148,17 @@ export function ProviderCard({ config, setConfig, threadId }: { config: Config; 
   const serviceTier = config.codex_service_tier || "default";
   const fastSupported = !selectedModel || selectedModel.serviceTiers?.some(tier => tier.id === "priority" || tier.id === "fast") || selectedModel.additionalSpeedTiers?.includes("fast");
   const modelLabel = selectedModel?.displayName || selectedModel?.id || "CLI 默认模型";
+  const persistImmediate = (patch: Record<string, unknown>, fallback: Partial<Config>) => {
+    void updateConfigPatch(patch).catch(() => setConfigImmediately(current => ({ ...current, ...fallback })));
+  };
   return <Card className="panel-card" title={<span><IconSettings /> Provider 与模型</span>}>
     <div className="form-grid">
       <div className="form-field"><span className="field-label-text">答题 Provider</span><Select disabled={config.simple_mode_enabled} value={config.provider} onChange={v => setConfig(c => ({ ...c, provider: v }))}><Select.Option value="codex-cli">Codex CLI</Select.Option><Select.Option value="openai-api">OpenAI API</Select.Option><Select.Option value="claude-code-cli">Claude Code CLI</Select.Option></Select></div>
-      <label className="switch-line">极简模式（A–F 单选题）<Switch checked={config.simple_mode_enabled} disabled={!config.lan_control_enabled} onChange={enabled => setConfig(c => enabled
+      <label className="switch-line">极简模式（A–F 单选题）<Switch checked={config.simple_mode_enabled} disabled={!config.lan_control_enabled} onChange={enabled => { setConfigImmediately(c => enabled
         ? { ...c, simple_mode_enabled: true, simple_mode_previous_provider: c.provider, provider: "openai-api" }
-        : { ...c, simple_mode_enabled: false, provider: c.simple_mode_previous_provider || "openai-api", simple_mode_previous_provider: null })} /></label>
-      {!config.simple_mode_enabled && config.provider !== "claude-code-cli" ? <><label className="switch-line">截图后直接提交<Switch checked={config.auto_submit_after_capture} onChange={value => setConfig(c => ({ ...c, auto_submit_after_capture: value }))} /></label><label className="switch-line">连续对话<Switch checked={config.conversation_mode === "continuous"} onChange={value => setConfig(c => ({ ...c, conversation_mode: value ? "continuous" : "single", codex_execution_mode: value ? "interactive" : "exec" }))} /></label></> : null}
+        : { ...c, simple_mode_enabled: false, provider: c.simple_mode_previous_provider || "openai-api", simple_mode_previous_provider: null }); persistImmediate({ simple_mode_enabled: enabled }, { simple_mode_enabled: config.simple_mode_enabled, provider: config.provider, simple_mode_previous_provider: config.simple_mode_previous_provider }); }} /></label>
+      {config.provider !== "claude-code-cli" ? <label className="switch-line">截图后直接提交<Switch checked={config.auto_submit_after_capture} onChange={value => { setConfigImmediately(c => ({ ...c, auto_submit_after_capture: value })); persistImmediate({ auto_submit_after_capture: value }, { auto_submit_after_capture: config.auto_submit_after_capture }); }} /></label> : null}
+      {!config.simple_mode_enabled && config.provider !== "claude-code-cli" ? <label className="switch-line">连续对话<Switch checked={config.conversation_mode === "continuous"} onChange={value => { const conversation_mode = value ? "continuous" : "single"; setConfigImmediately(c => ({ ...c, conversation_mode, codex_execution_mode: value ? "interactive" : "exec" })); persistImmediate({ conversation_mode }, { conversation_mode: config.conversation_mode, codex_execution_mode: config.codex_execution_mode }); }} /></label> : null}
       {config.provider === "codex-cli" && config.conversation_mode === "continuous" ? <div className="form-field"><span className="field-label-text">已有会话</span><Select showSearch allowClear loading={threadsLoading} value={threadId || snapshot.interactive_thread_id} onChange={v => { if (v === "__new__") { void invoke("select_codex_thread", { threadId: "new" }); } else if (v) void invoke("select_codex_thread", { threadId: v }); }} placeholder={threadsLoading ? "正在读取会话…" : threadsError ? "会话读取失败" : threads.length ? "选择已有 Codex 会话" : "暂无可用会话"}><Select.Option value="__new__">新建会话（提交时自动创建）</Select.Option>{threads.map(thread => <Select.Option key={thread.id} value={thread.id}>{thread.name || thread.id}{formatThreadDate(thread.updatedAt) ? ` · ${formatThreadDate(thread.updatedAt)}` : ""}</Select.Option>)}</Select>{threadsError ? <Alert type="error" showIcon content={<span>读取 Codex 会话失败：<code>{threadsError}</code></span>} /> : !threadsLoading && !threads.length ? <div className="provider-hint">当前没有可列出的未归档会话。</div> : null}</div> : null}
       {config.provider !== "openai-api" ? <label>CLI 路径<Input value={config.codex_path} onChange={v => setConfig(c => ({ ...c, codex_path: v }))} placeholder="codex 或 claude" /></label> : null}
       {config.provider === "openai-api" ? <><label>API Base URL<Input value={config.openai_base_url} onChange={v => setConfig(c => ({ ...c, openai_base_url: v }))} placeholder="https://api.deepseek.com" /></label><label>API Key<Input.Password value={config.openai_api_key} onChange={v => setConfig(c => ({ ...c, openai_api_key: v }))} placeholder="留空则使用 OPENAI_API_KEY" /></label><label>OpenAI 模型<Input value={config.openai_model} onChange={v => setConfig(c => ({ ...c, openai_model: v }))} placeholder="deepseek-flash" /></label><div className="form-field"><span className="field-label-text">推理强度（reasoning_effort）</span><Select value={config.openai_reasoning_effort} onChange={value => setConfig(c => ({ ...c, openai_reasoning_effort: value }))}><Select.Option value="low">low · 精简推理</Select.Option><Select.Option value="high">high · 深度推理</Select.Option><Select.Option value="max">max · 最大推理</Select.Option></Select></div></> : null}
@@ -158,25 +170,35 @@ export function ProviderCard({ config, setConfig, threadId }: { config: Config; 
   </Card>;
 }
 
-export function DisplayCard({ config, setConfig }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>> }) {
+export function DisplayCard({ config, setConfig, setConfigImmediately, updateConfigPatch }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; setConfigImmediately: React.Dispatch<React.SetStateAction<Config>>; updateConfigPatch: (patch: Record<string, unknown>) => Promise<void> }) {
+  const { notify } = useAppState();
+  const persistImmediate = (patch: Record<string, unknown>, fallback: Partial<Config>) => {
+    void updateConfigPatch(patch).catch(() => setConfigImmediately(current => ({ ...current, ...fallback })));
+  };
   const update = async (field: "overlay_opacity" | "overlay_font_size", value: number) => {
-    setConfig(c => ({ ...c, [field]: value }));
+    const previous = config[field];
+    setConfigImmediately(c => ({ ...c, [field]: value }));
     const command = field === "overlay_opacity" ? "set_overlay_opacity" : "set_overlay_font_size";
-    try { await invoke(command, { value }); } catch { /* saved on submit */ }
+    try { await invoke(command, { value }); } catch (error) { setConfigImmediately(c => ({ ...c, [field]: previous })); notify("error", String(error)); }
   };
   return <Card className="panel-card" title={<span><IconSettings /> 浮窗显示</span>}>
     <div className="form-grid">
       <div className="form-field"><span className="field-label-text">主题</span><Select value={config.overlay_theme} onChange={v => setConfig(c => ({ ...c, overlay_theme: v }))}><Select.Option value="day">日间</Select.Option><Select.Option value="night">夜间</Select.Option><Select.Option value="follow">实时跟随</Select.Option></Select></div>
       <label>窗口宽度<InputNumber min={280} max={1600} value={config.overlay_width} onChange={v => setConfig(c => ({ ...c, overlay_width: Number(v || 560) }))} /></label>
       <label>窗口高度<InputNumber min={160} max={1200} value={config.overlay_height} onChange={v => setConfig(c => ({ ...c, overlay_height: Number(v || 420) }))} /></label>
-      <label>透明度 <span className="value-badge">{Math.round(config.overlay_opacity * 100)}%</span><Slider min={0.2} max={1} step={0.01} value={config.overlay_opacity} onChange={v => void update("overlay_opacity", Number(v))} /></label>
+      <label>透明度 <span className="value-badge">{Math.round(config.overlay_opacity * 100)}%</span><Slider min={0.2} max={0.95} step={0.01} value={config.overlay_opacity} onChange={v => void update("overlay_opacity", Number(v))} /></label>
       <label>字体大小 <span className="value-badge">{config.overlay_font_size}px</span><Slider min={4} max={48} value={config.overlay_font_size} onChange={v => void update("overlay_font_size", Number(v))} /></label>
+      <label className="switch-line">极简浮窗模式<Switch checked={config.overlay_minimal_mode} onChange={value => { setConfigImmediately(c => ({ ...c, overlay_minimal_mode: value })); persistImmediate({ overlay_minimal_mode: value }, { overlay_minimal_mode: config.overlay_minimal_mode }); }} /></label>
     </div>
+    <div className="provider-hint">极简浮窗只显示答案或状态，不显示截图预览，背景全透明。鼠标交互和透传请在全局快捷键卡片中设置。</div>
   </Card>;
 }
 
-export function LanControlCard({ config, setConfig }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>> }) {
+export function LanControlCard({ config, setConfig, setConfigImmediately, updateConfigPatch }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; setConfigImmediately: React.Dispatch<React.SetStateAction<Config>>; updateConfigPatch: (patch: Record<string, unknown>) => Promise<void> }) {
   const { notify, snapshot } = useAppState();
+  const persistImmediate = (patch: Record<string, unknown>, fallback: Partial<Config>) => {
+    void updateConfigPatch(patch).catch(() => setConfigImmediately(current => ({ ...current, ...fallback })));
+  };
   const [localIp, setLocalIp] = useState("");
   const [ipLoading, setIpLoading] = useState(false);
   const [ipError, setIpError] = useState("");
@@ -194,8 +216,7 @@ export function LanControlCard({ config, setConfig }: { config: Config; setConfi
   };
   useEffect(() => { void refreshAddress(); }, []);
   const phoneUrl = localIp ? `http://${localIp}:${config.lan_control_port}/` : "";
-  const networkSettingsPending = config.lan_control_enabled !== snapshot.config.lan_control_enabled
-    || config.lan_control_port !== snapshot.config.lan_control_port;
+  const networkSettingsPending = config.lan_control_port !== snapshot.config.lan_control_port;
   const copyAddress = async () => {
     if (!phoneUrl || !config.lan_control_enabled) return;
     try {
@@ -218,15 +239,15 @@ export function LanControlCard({ config, setConfig }: { config: Config; setConfi
     }
   };
   return <Card className="panel-card" title="局域网手机控制">
-    <div className="form-grid"><label className="switch-line">启用局域网控制<Switch checked={config.lan_control_enabled} disabled={config.simple_mode_enabled} onChange={v => setConfig(c => ({ ...c, lan_control_enabled: v }))} /></label><label>端口<InputNumber min={1024} max={65535} value={config.lan_control_port} onChange={v => setConfig(c => ({ ...c, lan_control_port: Number(v || 18765) }))} /></label></div>
-    <label className="switch-line">手机自动保存完整截图<Switch checked={config.mobile_auto_save_images} onChange={v => setConfig(c => ({ ...c, mobile_auto_save_images: v }))} /></label>
+    <div className="form-grid"><label className="switch-line">启用局域网控制<Switch checked={config.lan_control_enabled} disabled={config.simple_mode_enabled} onChange={v => { setConfigImmediately(c => ({ ...c, lan_control_enabled: v })); persistImmediate({ lan_control_enabled: v }, { lan_control_enabled: config.lan_control_enabled }); }} /></label><label>端口<InputNumber min={1024} max={65535} value={config.lan_control_port} onChange={v => setConfig(c => ({ ...c, lan_control_port: Number(v || 18765) }))} /></label></div>
+    <label className="switch-line">手机自动保存完整截图<Switch checked={config.mobile_auto_save_images} onChange={v => { setConfigImmediately(c => ({ ...c, mobile_auto_save_images: v })); persistImmediate({ mobile_auto_save_images: v }, { mobile_auto_save_images: config.mobile_auto_save_images }); }} /></label>
     <div className="lan-address-panel">
       <div className="lan-address-head"><strong>手机访问地址</strong><Space size={4}>
         <ArcoButton type="text" size="small" icon={<IconRefresh />} loading={ipLoading} onClick={() => void refreshAddress()} aria-label="刷新本机 IP 地址" />
         <ArcoButton type="text" size="small" icon={<IconCopy />} disabled={!phoneUrl || !config.lan_control_enabled} onClick={() => void copyAddress()} aria-label="复制手机访问地址" />
       </Space></div>
       <Input value={phoneUrl} readOnly placeholder={ipLoading ? "正在探测本机 IP 地址…" : "未检测到本机 IPv4 地址，可点击刷新"} />
-      <Text type="secondary">{!config.lan_control_enabled ? "开启并保存局域网控制后，手机才能访问此地址。" : networkSettingsPending ? "保存配置后生效；手机和电脑需连接同一局域网。" : "手机和电脑连接同一局域网后可打开此地址。"}</Text>
+      <Text type="secondary">{!config.lan_control_enabled ? "开启局域网控制后，手机才能访问此地址。" : networkSettingsPending ? "端口修改保存后生效；手机和电脑需连接同一局域网。" : "手机和电脑连接同一局域网后可打开此地址。"}</Text>
       {ipError ? <Text type="secondary">{ipError}</Text> : null}
     </div>
     <Text type="secondary">关闭局域网控制后会释放监听端口；端口和开关未变化时不会重复重启服务。</Text><Text type="secondary">手机业务数据使用临时 ECDH 会话与 AES-256-GCM 加密传输。</Text>
@@ -239,17 +260,43 @@ export function PromptCard({ config, setConfig }: { config: Config; setConfig: R
 
 const hotkeyLabels: Record<string, string> = { general: "通用截图", math: "数学截图", code: "代码截图", submit: "提交", clear: "清空", toggle: "显隐浮窗", previous: "上一页", next: "下一页", opacity_down: "降低透明度", opacity_up: "提高透明度", font_down: "减小字号", font_up: "增大字号", move_up: "上移浮窗", move_down: "下移浮窗", move_left: "左移浮窗", move_right: "右移浮窗", port_check: "检测本地端口" };
 
-export function HotkeysCard({ config, setConfig, onValidityChange }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; onValidityChange?: (valid: boolean) => void }) {
+export function HotkeysCard({ config, setConfig, setConfigImmediately, updateConfigPatch, onValidityChange }: { config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>; setConfigImmediately: React.Dispatch<React.SetStateAction<Config>>; updateConfigPatch: (patch: Record<string, unknown>) => Promise<void>; onValidityChange?: (valid: boolean) => void }) {
+  const { snapshot } = useAppState();
   const [errors, setErrors] = useState<Record<string, string>>({});
   const entries = Object.keys(hotkeyLabels);
+  const selectedPresetId = snapshot.draft?.preset_id ?? snapshot.selected_preset_id ?? "general";
+  const selectedPresetName = snapshot.presets.find(preset => preset.id === selectedPresetId)?.name ?? "当前题型";
+  const mouseRoles: Record<string, string> = config.overlay_interactive_mode
+    ? {
+        [selectedPresetId]: "左键并行",
+        toggle: "右键也可隐藏",
+        previous: "滚轮上滑并行",
+        next: "滚轮下滑并行",
+      }
+    : {};
+  const persistImmediate = (patch: Record<string, unknown>, fallback: Partial<Config>) => {
+    void updateConfigPatch(patch).catch(() => setConfigImmediately(current => ({ ...current, ...fallback })));
+  };
   const validate = () => {
     const seen = new Map<string, string>(); const next: Record<string, string> = {};
     entries.forEach(k => { const v = config.hotkeys[k]; if (!v) return; const prior = seen.get(v.toLowerCase()); if (prior) { next[k] = "与“" + hotkeyLabels[prior] + "”冲突"; next[prior] = "与“" + hotkeyLabels[k] + "”冲突"; } else seen.set(v.toLowerCase(), k); });
     setErrors(next); onValidityChange?.(Object.keys(next).length === 0); return Object.keys(next).length === 0;
   };
-  useEffect(() => { void validate(); }, [config.hotkeys]);
+  useEffect(() => { void validate(); }, [config.hotkeys, config.overlay_interactive_mode, selectedPresetId]);
   const change = (key: string, value: string) => { setConfig(c => ({ ...c, hotkeys: { ...c.hotkeys, [key]: value } })); };
-  return <Card className="panel-card" title="全局快捷键"><div className="hotkey-grid">{entries.map(k => <label key={k}>{hotkeyLabels[k]}<ShortcutInput value={config.hotkeys[k] ?? ""} onChange={v => change(k, v)} error={errors[k]} /></label>)}</div><div className="hotkey-hint">点击输入框后直接按下组合键，建议使用 Ctrl/Alt/Shift 作为修饰键。</div><ActionButton type="secondary" onClick={() => void validate()}>检查冲突</ActionButton></Card>;
+  return <Card className="panel-card" title="全局快捷键">
+    <div className="hotkey-grid">{entries.map(k => <label key={k}><span className="hotkey-label">{hotkeyLabels[k]}{mouseRoles[k] ? <Tag color="gray">{mouseRoles[k]}</Tag> : null}</span><ShortcutInput value={config.hotkeys[k] ?? ""} onChange={v => change(k, v)} error={errors[k]} /></label>)}</div>
+    <div className="hotkey-hint">点击输入框后直接按下组合键，建议使用 Ctrl/Alt/Shift 作为修饰键。</div>
+    <label className="switch-line">鼠标交互模式<Switch checked={config.overlay_interactive_mode} onChange={value => { setConfigImmediately(c => ({ ...c, overlay_interactive_mode: value })); persistImmediate({ overlay_interactive_mode: value }, { overlay_interactive_mode: config.overlay_interactive_mode }); }} /></label>
+    {config.overlay_interactive_mode ? <>
+      <div className="form-grid hotkey-mouse-options">
+        <label className="switch-line">鼠标透传<Switch checked={config.overlay_mouse_passthrough} onChange={value => { setConfigImmediately(c => ({ ...c, overlay_mouse_passthrough: value })); persistImmediate({ overlay_mouse_passthrough: value }, { overlay_mouse_passthrough: config.overlay_mouse_passthrough }); }} /></label>
+        <label className="switch-line">仅浮窗范围内触发<Switch checked={config.overlay_mouse_restrict_to_overlay} onChange={value => { setConfigImmediately(c => ({ ...c, overlay_mouse_restrict_to_overlay: value })); persistImmediate({ overlay_mouse_restrict_to_overlay: value }, { overlay_mouse_restrict_to_overlay: config.overlay_mouse_restrict_to_overlay }); }} /></label>
+      </div>
+      <div className="hotkey-hint">鼠标操作与快捷键并行生效：左键单击也可触发“{selectedPresetName}”截图，按住左键移动可拖动浮窗；右键也可隐藏浮窗；滚轮也可翻动上一页和下一页。对应的截图、显隐和翻页快捷键仍可使用。鼠标透传控制浮窗区域的原始操作是否交给下层应用；范围开关限制快捷操作的触发区域。截图是否立即提交由“截图后直接提交”设置控制。</div>
+    </> : null}
+    <ActionButton type="secondary" onClick={() => void validate()}>检查冲突</ActionButton>
+  </Card>;
 }
 export function PresetList({ snapshot, onRefresh }: { snapshot: Snapshot; onRefresh: () => Promise<void> }) {
   const [editing, setEditing] = useState<Preset | undefined>(undefined);
@@ -282,7 +329,7 @@ export function PresetList({ snapshot, onRefresh }: { snapshot: Snapshot; onRefr
     <Space direction="vertical" size={10} style={{ width: "100%" }}>
       {snapshot.presets.map(p => <div className="preset-row" key={p.id} role="button" tabIndex={0} onClick={() => open(p)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(p); } }}>
         <div className="preset-copy">
-          <div className="preset-heading"><Text bold>{p.name}</Text><Tag color={p.built_in ? "arcoblue" : "gray"}>{p.built_in ? "内置 · 可编辑" : "自定义"}</Tag></div>
+          <div className="preset-heading"><Text bold>{p.name}</Text><Tag color={p.built_in ? "arcoblue" : "gray"}>{p.built_in ? "内置 · 可编辑" : "自定义"}</Tag>{snapshot.config.overlay_interactive_mode && snapshot.selected_preset_id === p.id ? <Tag color="orange">左键接管截图快捷键</Tag> : null}</div>
           <div className="preset-template" title={p.task_template}>{p.task_template}</div>
         </div>
         <div className="preset-actions" onClick={event => event.stopPropagation()}>
@@ -302,27 +349,34 @@ export function PresetList({ snapshot, onRefresh }: { snapshot: Snapshot; onRefr
     </Modal>
   </Card>;
 }export function ConfigPage() {
-  const { snapshot, pending, toast, command, updateConfig, refresh, notify } = useAppState();
+  const { snapshot, pending, toast, command, updateConfig, updateConfigPatch, refresh, notify } = useAppState();
   const [config, setConfig] = useState<Config>(snapshot.config);
   const [dirty, setDirty] = useState(false);
   const [hotkeysValid, setHotkeysValid] = useState(true);
   useEffect(() => { if (!dirty) setConfig(snapshot.config); }, [snapshot.config, dirty]);
   const setConfigTracked: React.Dispatch<React.SetStateAction<Config>> = value => { setDirty(true); setConfig(value); };
+  const setConfigImmediately: React.Dispatch<React.SetStateAction<Config>> = value => { setConfig(value); };
   const save = async () => { if (!hotkeysValid) { notify("error", "请先修正标红的快捷键冲突"); return; } await updateConfig(config); setDirty(false); };
-  return <div className="desktop-shell"><header className="app-header"><div><Title heading={2}>宝宝巴士</Title><Text type="secondary">截图做题助手 · 配置中心</Text></div><ActionButton type="primary" icon={<IconSave />} onClick={() => void save()}>保存配置</ActionButton></header><div className="system-strip"><div className={`protection-status ${snapshot.protected_overlay ? "is-protected" : "is-unverified"}`}><span className="protection-dot" /><div><strong>浮窗捕获保护</strong><small>{snapshot.protected_overlay ? "已启用 · 答案可安全展示" : "待确认 · 暂不展示答案"}</small></div></div><Text type="secondary">保护状态独立于任务提示，配置保存后自动生效</Text></div><main className="config-main"><TaskPanel snapshot={snapshot} pending={pending} onCommand={command} /><Row gutter={[16, 16]}><Col xs={24} md={12}><ProviderCard config={config} setConfig={setConfigTracked} /><DisplayCard config={config} setConfig={setConfigTracked} /><LanControlCard config={config} setConfig={setConfigTracked} /></Col><Col xs={24} md={12}><PromptCard config={config} setConfig={setConfigTracked} /><HotkeysCard config={config} setConfig={setConfigTracked} onValidityChange={setHotkeysValid} /><PresetList snapshot={snapshot} onRefresh={refresh} /></Col></Row></main><ToastView toast={toast} /></div>;
+  return <div className="desktop-shell"><header className="app-header"><div><Title heading={2}>宝宝巴士</Title><Text type="secondary">截图做题助手 · 配置中心</Text></div><ActionButton type="primary" icon={<IconSave />} onClick={() => void save()}>保存配置</ActionButton></header><div className="system-strip"><div className={`protection-status ${snapshot.protected_overlay ? "is-protected" : "is-unverified"}`}><span className="protection-dot" /><div><strong>浮窗捕获保护</strong><small>{snapshot.protected_overlay ? "已启用 · 答案可安全展示" : "待确认 · 暂不展示答案"}</small></div></div><Text type="secondary">开关和滑块立即生效；其他修改保存后生效</Text></div><main className="config-main"><TaskPanel snapshot={snapshot} pending={pending} onCommand={command} /><Row gutter={[16, 16]}><Col xs={24} md={12}><ProviderCard config={config} setConfig={setConfigTracked} setConfigImmediately={setConfigImmediately} updateConfigPatch={updateConfigPatch} /><DisplayCard config={config} setConfig={setConfigTracked} setConfigImmediately={setConfigImmediately} updateConfigPatch={updateConfigPatch} /><LanControlCard config={config} setConfig={setConfigTracked} setConfigImmediately={setConfigImmediately} updateConfigPatch={updateConfigPatch} /></Col><Col xs={24} md={12}><PromptCard config={config} setConfig={setConfigTracked} /><HotkeysCard config={config} setConfig={setConfigTracked} setConfigImmediately={setConfigImmediately} updateConfigPatch={updateConfigPatch} onValidityChange={setHotkeysValid} /><PresetList snapshot={snapshot} onRefresh={refresh} /></Col></Row></main><ToastView toast={toast} /></div>;
 }
 
 export function OverlayApp() {
-  const { snapshot } = useAppState();
+  const { snapshot, notify } = useAppState();
   const [background, setBackground] = useState<[number, number, number]>([22, 30, 48]);
   const answerRef = useRef<HTMLDivElement>(null);
+  const interactive = snapshot.config.overlay_interactive_mode;
+  const overlayClass = "overlay-root";
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    listen<{ delta: number }>("overlay-scroll", event => {
+    listen<{ delta?: number; wheel_delta?: number }>("overlay-scroll", event => {
       const element = answerRef.current;
       if (!element || disposed) return;
-      const direction = event.payload?.delta >= 0 ? 1 : -1;
+      if (typeof event.payload?.wheel_delta === "number") {
+        element.scrollBy({ top: -(event.payload.wheel_delta / 120) * 80, behavior: "auto" });
+        return;
+      }
+      const direction = (event.payload?.delta ?? 1) >= 0 ? 1 : -1;
       const distance = Math.max(96, Math.floor(element.clientHeight * 0.78));
       element.scrollBy({ top: direction * distance, behavior: "smooth" });
     }).then(fn => {
@@ -330,6 +384,22 @@ export function OverlayApp() {
     }).catch(() => undefined);
     return () => { disposed = true; unlisten?.(); };
   }, []);
+  useEffect(() => {
+    if (!interactive) return;
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    listen("overlay-mouse-left", () => {
+      if (!disposed) void invoke("capture_and_submit_overlay").catch(error => notify("error", String(error)));
+    }).then(fn => {
+      if (disposed) fn(); else unlisteners.push(fn);
+    }).catch(() => undefined);
+    listen("overlay-mouse-right", () => {
+      if (!disposed) void invoke("hide_overlay").catch(error => notify("error", String(error)));
+    }).then(fn => {
+      if (disposed) fn(); else unlisteners.push(fn);
+    }).catch(() => undefined);
+    return () => { disposed = true; unlisteners.forEach(unlisten => unlisten()); };
+  }, [interactive, notify]);
   useEffect(() => { answerRef.current?.scrollTo({ top: 0 }); }, [snapshot.answer?.text]);  useEffect(() => {
     if (snapshot.config.simple_mode_enabled || snapshot.config.overlay_theme !== "follow") return;
     let active = true;
@@ -352,7 +422,37 @@ export function OverlayApp() {
   const foreground = darkPanel ? "rgba(248, 251, 255, " + textAlpha + ")" : "rgba(16, 24, 39, " + textAlpha + ")";
   if (snapshot.config.simple_mode_enabled) {
     const symbol = snapshot.protected_overlay ? snapshot.quick_overlay_symbol : undefined;
-    return <div className="overlay-root simple-overlay">{symbol ? <div className="simple-overlay-symbol" style={{ color: "#000", opacity: snapshot.config.overlay_opacity, fontSize: snapshot.config.overlay_font_size }}>{symbol}</div> : null}</div>;
+    return <div className={`${overlayClass} simple-overlay`}>{symbol ? <div className="simple-overlay-symbol" style={{ color: "#000", opacity: snapshot.config.overlay_opacity, fontSize: snapshot.config.overlay_font_size }}>{symbol}</div> : null}</div>;
   }
-  return <div className="overlay-root"><div className="overlay-content" style={{ backgroundColor: panel, color: foreground, fontSize: snapshot.config.overlay_font_size }}><div className="overlay-meta" style={{ color: darkPanel ? "rgba(255,255,255,.74)" : "rgba(16,24,39,.72)" }}><span>宝宝巴士 · {snapshot.draft?.image_count ?? 0} 张图片</span><span>{snapshot.status}</span></div>{snapshot.draft?.thumbnails?.length ? <div className="overlay-thumbs">{snapshot.draft.thumbnails.map((src, i) => <img key={i} src={src} alt={"题图 " + (i + 1)} />)}</div> : null}{snapshot.answer?.text ? <div ref={answerRef} className="overlay-answer">{snapshot.answer.text}</div> : <div className="overlay-wait" style={{ color: darkPanel ? "rgba(255,255,255,.72)" : "rgba(16,24,39,.68)" }}>等待答案…</div>}</div></div>;
+  const minimalStatus = snapshot.status === "capturing" ? "截图中…"
+    : snapshot.status === "solving" ? "处理中…"
+      : snapshot.status === "drafting" ? "等待提交…"
+        : snapshot.status === "failed" || snapshot.status === "error" ? snapshot.message || "出错"
+          : snapshot.status === "cancelled" || snapshot.status === "canceled" ? "已取消"
+            : "等待截图…";
+  const minimalText = snapshot.status === "capturing" || snapshot.status === "solving"
+    ? minimalStatus
+    : snapshot.answer?.text || minimalStatus;
+  if (snapshot.config.overlay_minimal_mode) {
+    return (
+      <div className={`${overlayClass} minimal-overlay`}>
+        <div ref={answerRef} className="minimal-overlay-content" style={{ color: darkPanel ? "#f8fbff" : "#101827", opacity: alpha, fontSize: snapshot.config.overlay_font_size }}>
+          {minimalText}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className={overlayClass}>
+      <div className="overlay-content" style={{ backgroundColor: panel, color: foreground, fontSize: snapshot.config.overlay_font_size }}>
+        <div className="overlay-meta" style={{ color: darkPanel ? "rgba(255,255,255,.74)" : "rgba(16,24,39,.72)" }}>
+          <span>宝宝巴士 · {snapshot.draft?.image_count ?? 0} 张图片</span><span>{snapshot.status}</span>
+        </div>
+        {snapshot.draft?.thumbnails?.length ? <div className="overlay-thumbs">{snapshot.draft.thumbnails.map((src, i) => <img key={i} src={src} alt={"题图 " + (i + 1)} />)}</div> : null}
+        {snapshot.answer?.text
+          ? <div ref={answerRef} className="overlay-answer">{snapshot.answer.text}</div>
+          : <div className="overlay-wait" style={{ color: darkPanel ? "rgba(255,255,255,.72)" : "rgba(16,24,39,.68)" }}>等待答案…</div>}
+      </div>
+    </div>
+  );
 }
